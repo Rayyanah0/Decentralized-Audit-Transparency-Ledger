@@ -265,7 +265,7 @@ pub struct PriceFeed {
     pub oracle: Address,
     /// Opaque metadata blob (data source, methodology, …).
     pub metadata: Bytes,
-    /// Integrity hash: sha256(asset_id_bytes || price_le || confidence_le || observed_at_le).
+    /// Integrity hash: env.crypto().sha256(asset_id_bytes || price_le || confidence_le || observed_at_le).
     pub integrity_hash: BytesN<32>,
 }
 
@@ -387,7 +387,7 @@ pub enum OracleDataKey {
 
 /// Computes the integrity hash for a raw price feed.
 ///
-/// `sha256(asset_id_bytes || price_le_16 || confidence_le_16 || observed_at_le_8)`
+/// `env.crypto().sha256(asset_id_bytes || price_le_16 || confidence_le_16 || observed_at_le_8)`
 pub fn compute_feed_hash(
     env: &Env,
     asset_id: &Symbol,
@@ -407,7 +407,7 @@ pub fn compute_feed_hash(
 
 /// Computes the chain hash for a canonical price entry.
 ///
-/// `sha256(asset_id_bytes || price_le_16 || consensus_at_le_8 || prev_hash_32)`
+/// `env.crypto().sha256(asset_id_bytes || price_le_16 || consensus_at_le_8 || prev_hash_32)`
 pub fn compute_canonical_hash(
     env: &Env,
     asset_id: &Symbol,
