@@ -1,18 +1,104 @@
+cargo-features = ["trim-paths"]
+
 [package]
 name = "audit-ledger"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.81"
+license = "Apache-2.0"
+repository = "https://github.com/example/audit-ledger"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[[bin]]
+name = "drip"
+path = "src/bin/drip.rs"
+
+[features]
+# `AuditLedger` is the deployed contract; a Soroban WASM exposes a single contract
+# interface, so the other standalone contracts in this crate are opt-in and are
+# always compiled into host test builds.
+contract-event-privacy = []
+privacy-analytics = []
+data-governance = []
+multi-tenant = []
+# Enables the SDK testutils codegen for this crate's own types.
+testutils = ["soroban-sdk/testutils"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:anyhow"]
+
+# The contract is the workspace root; `bench/` hosts the contract benchmarking
+# suite (`cargo bench -p audit-ledger-bench`). It is a separate package so the
+# heavy integration-test dev-dependencies below are never built for benchmarks.
+[workspace]
+members = ["bench"]
+resolver = "2"
+
 [dependencies]
-soroban-sdk = "27.0.6"
+soroban-sdk = "28.0.0"
+clap = { version = "4.5", features = ["derive", "cargo", "env"], optional = true }
+anyhow = { version = "1.0", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+qrcode = { version = "0.14", optional = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "27.0.6", features = ["testutils"] }
-rand = "0.9"
+soroban-sdk = { version = "28.0.0", features = ["testutils"] }
+rand = "0.10"
 proptest = "1"
+
+# ── Testcontainers integration-test dependencies ───────────────────────────────
+# Core testcontainers runtime (async, tokio-based)
+testcontainers        = { version = "0.27.3", default-features = false, features = ["ring"] }
+# Community modules: PostgreSQL, Redis, Kafka, Zookeeper (Kafka dependency)
+testcontainers-modules = { version = "0.15.0", default-features = false, features = [
+    "postgres",
+    "redis",
+    "kafka",
+    "zookeeper",
+] }
+
+# Async runtime for integration tests
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+# PostgreSQL client (used in container tests)
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+
+# Redis async client
+redis = { version = "1.7.0", features = ["tokio-comp", "connection-manager"] }
+
+# Kafka producer/consumer
+rdkafka = { version = "0.39.0", default-features = false, features = [
+    "cmake-build",
+    "tokio",
+] }
+
+# Pulsar producer/consumer
+pulsar = { version = "6.3.1", default-features = false, features = [
+    "tokio-runtime",
+    "compression",
+    "auth-oauth2",
+] }
+
+# HTTP client for Soroban RPC mock calls
+reqwest = { version = "0.12.0", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+
+# JSON serialization for RPC payloads
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+
+# UUID generation for test data
+uuid = { version = "1", features = ["v4"] }
+
+# Parallel test execution helpers
+futures = "0.3"
+
+# Serial-test macro for tests that must NOT run in parallel
+serial_test = "4.0"
 
 [profile.release]
 opt-level = "z"
@@ -20,3 +106,30 @@ overflow-checks = true
 lto = true
 debug = 0
 strip = "symbols"
+codegen-units = 1
+incremental = false
+
+# Reproducible build profile for CI artifact verification
+[profile.reproducible]
+inherits = "release"
+codegen-units = 1
+incremental = false
+
+debug = 0
+strip = "symbols"
+panic = "abort"
+lto = "fat"
+
+# Deterministic source replacement for supply-chain verification
+# [source.crates-io]
+# replace-with = "vendored-sources"
+
+# [source.vendored-sources]
+# directory = "vendor"
+
+[net]
+offline = true
+
+# [patch.crates-io]
+# soroban-sdk = { version = "27.0.6" }
+

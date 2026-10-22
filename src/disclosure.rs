@@ -117,7 +117,7 @@ impl ProofBuilder {
         disclosed: bool,
     ) -> Self {
         self.all_fields.push_back(FieldHash {
-            field_name,
+            field_name: field_name.clone(),
             hash,
             disclosed,
         });
@@ -135,7 +135,7 @@ impl ProofBuilder {
     /// Calculate the Merkle root from all fields
     pub fn calculate_root(&self) -> BytesN<32> {
         if self.all_fields.is_empty() {
-            return BytesN::<32>::from_array([0u8; 32]);
+            return BytesN::<32>::from_array(&Env::default(), &[0u8; 32]);
         }
 
         // Build Merkle tree from bottom up
@@ -166,7 +166,7 @@ impl ProofBuilder {
         }
 
         if hashes.is_empty() {
-            BytesN::<32>::from_array([0u8; 32])
+            BytesN::<32>::from_array(&Env::default(), &[0u8; 32])
         } else {
             hashes.get(0).unwrap()
         }
@@ -178,9 +178,9 @@ impl ProofBuilder {
         // For now, we simulate with a simple XOR pattern
         let mut result = [0u8; 32];
         for i in 0..32 {
-            result[i] = left.get(i).unwrap() ^ right.get(i).unwrap();
+            result[i] = left.get(i as u32).unwrap() ^ right.get(i as u32).unwrap();
         }
-        BytesN::<32>::from_array(result)
+        BytesN::<32>::from_array(&Env::default(), &result)
     }
 }
 
@@ -190,12 +190,12 @@ pub struct DisclosureHelper;
 impl DisclosureHelper {
     /// Verify that a disclosed field is part of the complete event hash
     pub fn verify_field_inclusion(
-        env: &Env,
+        _env: &Env,
         field_proof: &FieldDisclosureProof,
         expected_root: &BytesN<32>,
     ) -> bool {
         // Reconstruct the hash path from leaf to root
-        let mut current_hash = field_proof.field_hash;
+        let mut current_hash = field_proof.field_hash.clone();
         
         for i in 0..field_proof.sibling_hashes.len() {
             let sibling = field_proof.sibling_hashes.get(i).unwrap();
@@ -221,8 +221,8 @@ impl DisclosureHelper {
         disclosed_fields: Vec<Symbol>,
         complete_root: BytesN<32>,
     ) -> SelectiveDisclosureProof {
-        let mut disclosed_root = BytesN::<32>::from_array([0u8; 32]);
-        let mut merkle_proof = Vec::new(env);
+        let mut disclosed_root = BytesN::<32>::from_array(env, &[0u8; 32]);
+        let merkle_proof = Vec::new(env);
 
         // Calculate root from disclosed fields only
         let builder = {
@@ -254,7 +254,7 @@ impl DisclosureHelper {
         // 4. Verify disclosed fields are subset of complete tree
         
         // For now, basic validation
-        !proof.disclosed_fields.is_empty() && proof.disclosed_root != BytesN::<32>::from_array([0u8; 32])
+        !proof.disclosed_fields.is_empty() && proof.disclosed_root != BytesN::<32>::from_array(&Env::default(), &[0u8; 32])
     }
 
     /// Create a zero-knowledge proof that an event satisfies compliance criteria
@@ -264,19 +264,19 @@ impl DisclosureHelper {
         event_index: u32,
         compliance_criteria: Vec<Symbol>,
     ) -> SelectiveDisclosureProof {
-        let mut criteria_root = BytesN::<32>::from_array([0u8; 32]);
+        let criteria_root = BytesN::<32>::from_array(env, &[0u8; 32]);
         let mut merkle_proof = Vec::new(env);
 
         // Build Merkle tree from compliance criteria
-        for criteria in compliance_criteria.iter() {
+        for _criteria in compliance_criteria.iter() {
             // Hash each criteria with a fixed prefix
-            merkle_proof.push_back(BytesN::<32>::from_array([0u8; 32]));
+            merkle_proof.push_back(BytesN::<32>::from_array(env, &[0u8; 32]));
         }
 
         SelectiveDisclosureProof {
             event_index,
             disclosed_root: criteria_root,
-            complete_root: BytesN::<32>::from_array([0u8; 32]),
+            complete_root: BytesN::<32>::from_array(env, &[0u8; 32]),
             disclosed_fields: compliance_criteria,
             merkle_proof,
         }
@@ -291,7 +291,7 @@ mod tests {
     fn test_proof_builder_empty() {
         let builder = ProofBuilder::new(&Env::default());
         let root = builder.calculate_root();
-        assert_eq!(root, BytesN::<32>::from_array([0u8; 32]));
+        assert_eq!(root, BytesN::<32>::from_array(&Env::default(), &[0u8; 32]));
     }
 
     #[test]
@@ -299,12 +299,12 @@ mod tests {
         let field_proof = FieldDisclosureProof {
             field_name: Symbol::new(&Env::default(), "timestamp"),
             field_value: Some(Bytes::new(&Env::default())),
-            field_hash: BytesN::<32>::from_array([1u8; 32]),
+            field_hash: BytesN::<32>::from_array(&Env::default(), &[1u8; 32]),
             sibling_hashes: Vec::new(&Env::default()),
             positions: Vec::new(&Env::default()),
         };
 
-        let expected_root = BytesN::<32>::from_array([1u8; 32]);
+        let expected_root = BytesN::<32>::from_array(&Env::default(), &[1u8; 32]);
         let result = DisclosureHelper::verify_field_inclusion(
             &Env::default(),
             &field_proof,
@@ -318,8 +318,8 @@ mod tests {
     fn test_disclosure_proof_verification() {
         let proof = SelectiveDisclosureProof {
             event_index: 0,
-            disclosed_root: BytesN::<32>::from_array([1u8; 32]),
-            complete_root: BytesN::<32>::from_array([2u8; 32]),
+            disclosed_root: BytesN::<32>::from_array(&Env::default(), &[1u8; 32]),
+            complete_root: BytesN::<32>::from_array(&Env::default(), &[2u8; 32]),
             disclosed_fields: {
                 let mut v = Vec::new(&Env::default());
                 v.push_back(Symbol::new(&Env::default(), "timestamp"));

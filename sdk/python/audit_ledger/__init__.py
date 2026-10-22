@@ -22,6 +22,15 @@ Public API
 - :func:`batch_get`           — free-function batch retrieval (#245).
 - :func:`batch_verify`        — free-function batch verification (#245).
 
+Pagination (#852)
+~~~~~~~~~~~~~~~~~
+- :class:`PageCursor`         — opaque cursor token for deterministic pagination.
+- :class:`PageLimit`          — page size cap (max 100 items).
+- :class:`QueryFilter`        — multi-predicate query filter.
+- :func:`paginate`            — apply cursor/limit to a collection.
+- :func:`query_paginated`     — filtered, cursor-based query helper.
+- :func:`iter_pages`          — full multi-page traversal generator.
+
 Social impact
 ~~~~~~~~~~~~~
 - :class:`SocialImpactMetrics`        — on-chain social impact snapshot model.
@@ -33,6 +42,14 @@ Social impact
 - :func:`community_investment_summary` — community investment aggregation.
 - :func:`labour_compliance_rate`      — labour-standards compliance summary.
 - :func:`aggregate_impact_report`     — build full ImpactReport from metrics list.
+
+SupTech rules (#832)
+~~~~~~~~~~~~~~~~~~~~
+- :class:`PageCursor`                 — opaque cursor token for paginated queries.
+- :class:`PageLimit`                  — page size cap (max 100 items).
+- :class:`RuleQueryFilter`            — multi-predicate filter for rule queries.
+- :class:`RuleQueryPage`              — paginated rule query result.
+- :func:`query_rules`                 — paginated, filtered rule query helper.
 """
 
 from .batch import (
@@ -46,6 +63,7 @@ from .batch import (
 from .cache import CacheConfig, CacheStats, LRUCache
 from .client import AuditLedgerClient
 from .models import Event, ContractError, RPCError, AuditLedgerError, Page
+from .crdt import CRDTOperation, EventCRDT
 from .async_client import AsyncAuditLedgerClient
 from .social_impact import (
     SocialImpactMetrics,
@@ -80,15 +98,60 @@ from .validation import (
     validate_event,
     BASE_EVENT_SCHEMA,
 )
+from .async_streaming import (
+    async_stream_events,
+    async_stream_by_type,
+    AsyncEventBatcher,
+)
+from .confidential import (
+    AccessControlPolicy,
+    AccessControlPolicyType,
+    ConfidentialEventPayload,
+    ConfidentialMetadataHelper,
+)
+from .pagination import (
+    PageCursor,
+    PageLimit,
+    QueryFilter,
+    paginate,
+    query_paginated,
+    iter_pages,
+)
+from .suptech_rules import (
+    RuleQueryFilter,
+    RuleQueryPage,
+    query_rules,
+)
+
+
 
 __all__ = [
     # Sync client
     "AuditLedgerClient",
     # Async client (#242)
     "AsyncAuditLedgerClient",
+    # Async streaming & batching (#392)
+    "async_stream_events",
+    "async_stream_by_type",
+    "AsyncEventBatcher",
+    # Confidential metadata (#401)
+    "AccessControlPolicy",
+    "AccessControlPolicyType",
+    "ConfidentialEventPayload",
+    "ConfidentialMetadataHelper",
     # Models
     "Event",
     "Page",
+    # Pagination (#852)
+    "PageCursor",
+    "PageLimit",
+    "QueryFilter",
+    "paginate",
+    "query_paginated",
+    "iter_pages",
+    # Contract event collaboration (issue #431)
+    "CRDTOperation",
+    "EventCRDT",
     # Exceptions (issue #249)
     "AuditLedgerError",
     "ContractError",
@@ -123,4 +186,8 @@ __all__ = [
     "training_effectiveness",
     "remediation_progress",
     "build_compliance_report",
+    # SupTech rules pagination & filtering (#832)
+    "RuleQueryFilter",
+    "RuleQueryPage",
+    "query_rules",
 ]

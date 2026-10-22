@@ -7,7 +7,7 @@ import { useServer } from "graphql-ws/dist/use/ws";
 import { makeExecutableSchema } from "@graphql-tools/schema";
 import { GraphQLError } from "graphql";
 import { typeDefs } from "./schema";
-import { resolvers } from "./resolvers";
+import { createEventLoaders, resolvers } from "./resolvers";
 import { validateKey } from "../../rest/src/keys";
 import type { Role } from "../../rest/src/keys";
 
@@ -37,7 +37,18 @@ async function main() {
     ws.on("close", () => activeConnections.delete(ws));
   });
 
-  const cleanup = useServer({ schema }, wsServer);
+  const cleanup = useServer(
+    {
+      schema,
+      context: (ctx) => {
+        const connectionParams = (ctx.connectionParams ?? {}) as Record<string, string>;
+        const apiKey = connectionParams["x-api-key"] ?? connectionParams.authorization?.replace("Bearer ", "");
+        const record = apiKey ? validateKey(apiKey) : null;
+        return { apiKey, role: record?.role, subscriptionAuthRequired: true };
+      },
+    },
+    wsServer,
+  );
 
   const apollo = new ApolloServer({
     schema,
@@ -68,7 +79,7 @@ async function main() {
             role = record.role;
           }
         }
-        return { apiKey, role };
+        return { apiKey, role, eventLoaders: createEventLoaders() };
       },
     })
   );

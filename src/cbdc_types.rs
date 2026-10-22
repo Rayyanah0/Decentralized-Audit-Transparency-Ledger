@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, contracttype};
 
 /// Represents supported CBDC pilots globally.
 #[contracttype]
@@ -18,12 +18,12 @@ pub enum CBDCPilot {
 }
 
 impl CBDCPilot {
-    pub fn as_symbol(&self) -> Symbol {
+    pub fn as_symbol(&self, env: &Env) -> Symbol {
         match self {
-            CBDCPilot::DigitalEuro => Symbol::new(&[b"EUR"]),
-            CBDCPilot::DigitalDollar => Symbol::new(&[b"USD"]),
-            CBDCPilot::eCNY => Symbol::new(&[b"CNY"]),
-            CBDCPilot::SandDollar => Symbol::new(&[b"BSD"]),
+            CBDCPilot::DigitalEuro => Symbol::new(env, "EUR"),
+            CBDCPilot::DigitalDollar => Symbol::new(env, "USD"),
+            CBDCPilot::eCNY => Symbol::new(env, "CNY"),
+            CBDCPilot::SandDollar => Symbol::new(env, "BSD"),
         }
     }
 
@@ -72,13 +72,18 @@ pub enum InteropProtocol {
 }
 
 impl InteropProtocol {
-    pub fn as_symbol(&self) -> Symbol {
+    /// Short on-chain code for this protocol.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            InteropProtocol::AtomicSwap => Symbol::new(&[b"ATOMIC_SWAP"]),
-            InteropProtocol::HubAndSpoke => Symbol::new(&[b"HUB_SPOKE"]),
-            InteropProtocol::ISO20022 => Symbol::new(&[b"ISO_20022"]),
-            InteropProtocol::CBPR => Symbol::new(&[b"CBPR"]),
+            InteropProtocol::AtomicSwap => "ATOMIC_SWAP",
+            InteropProtocol::HubAndSpoke => "HUB_SPOKE",
+            InteropProtocol::ISO20022 => "ISO_20022",
+            InteropProtocol::CBPR => "CBPR",
         }
+    }
+
+    pub fn as_symbol(&self, env: &Env) -> Symbol {
+        Symbol::new(env, self.as_str())
     }
 
     pub fn version(&self) -> &'static str {
@@ -107,13 +112,18 @@ pub enum PrivacyTier {
 }
 
 impl PrivacyTier {
-    pub fn as_symbol(&self) -> Symbol {
+    /// Short on-chain code for this privacy tier.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            PrivacyTier::Public => Symbol::new(&[b"PUBLIC"]),
-            PrivacyTier::Pseudonymous => Symbol::new(&[b"PSEUDO"]),
-            PrivacyTier::Private => Symbol::new(&[b"PRIVATE"]),
-            PrivacyTier::RegulatoryConfidential => Symbol::new(&[b"REGUL"]),
+            PrivacyTier::Public => "PUBLIC",
+            PrivacyTier::Pseudonymous => "PSEUDO",
+            PrivacyTier::Private => "PRIVATE",
+            PrivacyTier::RegulatoryConfidential => "REGUL",
         }
+    }
+
+    pub fn as_symbol(&self, env: &Env) -> Symbol {
+        Symbol::new(env, self.as_str())
     }
 
     pub fn requires_encryption(&self) -> bool {
@@ -146,12 +156,12 @@ pub enum OfflineStatus {
 }
 
 impl OfflineStatus {
-    pub fn as_symbol(&self) -> Symbol {
+    pub fn as_symbol(&self, env: &Env) -> Symbol {
         match self {
-            OfflineStatus::PendingReconciliation => Symbol::new(&[b"PENDING"]),
-            OfflineStatus::Reconciled => Symbol::new(&[b"RECON"]),
-            OfflineStatus::FailedReconciliation => Symbol::new(&[b"FAILED"]),
-            OfflineStatus::Disputed => Symbol::new(&[b"DISPUTE"]),
+            OfflineStatus::PendingReconciliation => Symbol::new(env, "PENDING"),
+            OfflineStatus::Reconciled => Symbol::new(env, "RECON"),
+            OfflineStatus::FailedReconciliation => Symbol::new(env, "FAILED"),
+            OfflineStatus::Disputed => Symbol::new(env, "DISPUTE"),
         }
     }
 
@@ -167,9 +177,9 @@ pub struct CBDCTransaction {
     /// Unique transaction ID (generated offline or on-chain)
     pub tx_id: BytesN<32>,
     /// Source CBDC pilot
-    pub source_pilot: u8, // CBDCPilot as u8
+    pub source_pilot: u32, // CBDCPilot as u8
     /// Destination CBDC pilot
-    pub dest_pilot: u8, // CBDCPilot as u8
+    pub dest_pilot: u32, // CBDCPilot as u8
     /// Sending account address
     pub from: Address,
     /// Receiving account address
@@ -183,11 +193,11 @@ pub struct CBDCTransaction {
     /// Timestamp of transaction creation
     pub timestamp: u64,
     /// Interoperability protocol used
-    pub protocol: u8, // InteropProtocol as u8
+    pub protocol: u32, // InteropProtocol as u8
     /// Privacy tier for this transaction
-    pub privacy_tier: u8, // PrivacyTier as u8
+    pub privacy_tier: u32, // PrivacyTier as u8
     /// Optional offline status
-    pub offline_status: Option<u8>, // OfflineStatus as u8
+    pub offline_status: Option<u32>, // OfflineStatus
     /// Transaction metadata
     pub metadata: Bytes,
 }
@@ -195,15 +205,11 @@ pub struct CBDCTransaction {
 impl CBDCTransaction {
     /// Computes content-hash for transaction (similar to audit log events)
     pub fn compute_hash(&self, prev_hash: &BytesN<32>) -> BytesN<32> {
-        use soroban_sdk::crypto::sha256;
-
+        
         let mut input = soroban_sdk::Bytes::new(prev_hash.env());
 
         // Append serializable fields for hashing
-        input.append(&Bytes::from_slice(
-            &self.tx_id.env(),
-            self.tx_id.as_ref(),
-        ));
+        input.append(&self.tx_id.to_bytes());
         input.append(&Bytes::from_slice(&self.tx_id.env(), &self.source_pilot.to_le_bytes()));
         input.append(&Bytes::from_slice(&self.tx_id.env(), &self.dest_pilot.to_le_bytes()));
         input.append(&Bytes::from_slice(
@@ -221,7 +227,7 @@ impl CBDCTransaction {
         input.append(&Bytes::from_slice(&self.tx_id.env(), &self.timestamp.to_le_bytes()));
         input.append(&self.metadata);
 
-        sha256(&input)
+        env.crypto().sha256(&input)
     }
 }
 
@@ -236,11 +242,92 @@ pub struct BatchSettlement {
     /// Total batch amount (source pilot)
     pub total_amount: u128,
     /// Settlement status
-    pub settlement_status: u8, // OfflineStatus as u8
+    pub settlement_status: u32, // OfflineStatus as u8
     /// Timestamp of batch creation
     pub created_at: u64,
     /// Timestamp of settlement
     pub settled_at: Option<u64>,
+}
+
+/// Deterministic, typed error variants for CBDC interoperability operations.
+///
+/// These variants are returned by `src/cbdc_interop.rs` instead of panicking
+/// when boundary conditions, malformed payloads, or arithmetic overflow are
+/// encountered during high-throughput Soroban ledger execution.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CBDCInteropError {
+    /// Arithmetic operation would overflow the target integer type.
+    ArithmeticOverflow = 0,
+    /// Arithmetic operation would underflow the target integer type.
+    ArithmeticUnderflow = 1,
+    /// Division or modulo by zero was attempted.
+    DivisionByZero = 2,
+    /// A collection exceeded its explicit maximum allowed length.
+    CollectionTooLong = 3,
+    /// A collection was empty where at least one element is required.
+    EmptyCollection = 4,
+    /// A payload was malformed or could not be decoded.
+    MalformedPayload = 5,
+    /// A payload exceeded the maximum allowed byte length.
+    PayloadTooLarge = 6,
+    /// An amount was outside the configured `[min_tx_amount, max_tx_amount]` bounds.
+    AmountOutOfBounds = 7,
+    /// An exchange rate was zero or otherwise invalid.
+    InvalidExchangeRate = 8,
+    /// A supplied enum discriminant did not map to a known variant.
+    InvalidEnumDiscriminant = 9,
+    /// A timestamp was earlier than the referenced lower bound.
+    InvalidTimestamp = 10,
+    /// A batch settlement referenced more transactions than permitted.
+    BatchSizeExceeded = 11,
+    /// A batch settlement total did not match the sum of its entries.
+    BatchTotalMismatch = 12,
+    /// The requested operation is not permitted for the current state.
+    InvalidState = 13,
+}
+
+impl CBDCInteropError {
+    /// Stable numeric code for this error, suitable for on-chain storage.
+    pub fn code(&self) -> u32 {
+        *self as u32
+    }
+
+    /// Short on-chain symbol for this error.
+    pub fn as_symbol(&self, env: &Env) -> Symbol {
+        match self {
+            CBDCInteropError::ArithmeticOverflow => Symbol::new(env, "OVRFLOW"),
+            CBDCInteropError::ArithmeticUnderflow => Symbol::new(env, "UNDRFLOW"),
+            CBDCInteropError::DivisionByZero => Symbol::new(env, "DIV_ZERO"),
+            CBDCInteropError::CollectionTooLong => Symbol::new(env, "TOO_LONG"),
+            CBDCInteropError::EmptyCollection => Symbol::new(env, "EMPTY"),
+            CBDCInteropError::MalformedPayload => Symbol::new(env, "MALFORMED"),
+            CBDCInteropError::PayloadTooLarge => Symbol::new(env, "TOO_LARGE"),
+            CBDCInteropError::AmountOutOfBounds => Symbol::new(env, "AMT_BOUND"),
+            CBDCInteropError::InvalidExchangeRate => Symbol::new(env, "BAD_RATE"),
+            CBDCInteropError::InvalidEnumDiscriminant => Symbol::new(env, "BAD_ENUM"),
+            CBDCInteropError::InvalidTimestamp => Symbol::new(env, "BAD_TIME"),
+            CBDCInteropError::BatchSizeExceeded => Symbol::new(env, "BATCH_MAX"),
+            CBDCInteropError::BatchTotalMismatch => Symbol::new(env, "BATCH_SUM"),
+            CBDCInteropError::InvalidState => Symbol::new(env, "BAD_STATE"),
+        }
+    }
+}
+
+/// Explicit maximum collection lengths enforced before writing state entries.
+///
+/// These bounds cap storage footprint and CPU instruction usage for the
+/// worst-case payload accepted by `src/cbdc_interop.rs`.
+pub mod limits {
+    /// Maximum number of transaction IDs permitted in a single batch settlement.
+    pub const MAX_BATCH_TRANSACTIONS: u32 = 1_000;
+    /// Maximum byte length of transaction metadata.
+    pub const MAX_METADATA_BYTES: u32 = 4_096;
+    /// Maximum byte length of an ISO-20022 message payload.
+    pub const MAX_ISO20022_PAYLOAD_BYTES: u32 = 16_384;
+    /// Maximum number of entries in a single cross-ledger settlement leg list.
+    pub const MAX_SETTLEMENT_LEGS: u32 = 64;
 }
 
 /// Configuration for CBDC interoperability operations.
@@ -272,6 +359,22 @@ impl CBDCConfig {
 
     pub fn is_valid_amount(&self, amount: u128) -> bool {
         amount >= self.min_tx_amount && amount <= self.max_tx_amount
+    }
+
+    /// Validates an amount, returning a typed error instead of panicking.
+    pub fn check_amount(&self, amount: u128) -> Result<(), CBDCInteropError> {
+        if amount < self.min_tx_amount || amount > self.max_tx_amount {
+            return Err(CBDCInteropError::AmountOutOfBounds);
+        }
+        Ok(())
+    }
+
+    /// Validates a batch size against both the config and the hard limit.
+    pub fn check_batch_size(&self, size: u32) -> Result<(), CBDCInteropError> {
+        if size > self.max_batch_size || size > limits::MAX_BATCH_TRANSACTIONS {
+            return Err(CBDCInteropError::BatchSizeExceeded);
+        }
+        Ok(())
     }
 }
 
@@ -318,5 +421,55 @@ mod tests {
         assert!(config.is_valid_amount(100));
         assert!(!config.is_valid_amount(0));
         assert!(!config.is_valid_amount(2_000_000_00));
+    }
+
+    #[test]
+    fn test_interop_error_codes_are_stable() {
+        assert_eq!(CBDCInteropError::ArithmeticOverflow.code(), 0);
+        assert_eq!(CBDCInteropError::CollectionTooLong.code(), 3);
+        assert_eq!(CBDCInteropError::MalformedPayload.code(), 5);
+        assert_eq!(CBDCInteropError::InvalidState.code(), 13);
+    }
+
+    #[test]
+    fn test_check_amount_boundaries() {
+        let config = CBDCConfig::default();
+        assert_eq!(config.check_amount(config.min_tx_amount), Ok(()));
+        assert_eq!(config.check_amount(config.max_tx_amount), Ok(()));
+        assert_eq!(
+            config.check_amount(config.min_tx_amount - 1),
+            Err(CBDCInteropError::AmountOutOfBounds)
+        );
+        assert_eq!(
+            config.check_amount(config.max_tx_amount + 1),
+            Err(CBDCInteropError::AmountOutOfBounds)
+        );
+        assert_eq!(
+            config.check_amount(u128::MAX),
+            Err(CBDCInteropError::AmountOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn test_check_batch_size_boundaries() {
+        let config = CBDCConfig::default();
+        assert_eq!(config.check_batch_size(0), Ok(()));
+        assert_eq!(config.check_batch_size(config.max_batch_size), Ok(()));
+        assert_eq!(
+            config.check_batch_size(config.max_batch_size + 1),
+            Err(CBDCInteropError::BatchSizeExceeded)
+        );
+        assert_eq!(
+            config.check_batch_size(u32::MAX),
+            Err(CBDCInteropError::BatchSizeExceeded)
+        );
+    }
+
+    #[test]
+    fn test_limits_are_bounded() {
+        assert!(limits::MAX_BATCH_TRANSACTIONS > 0);
+        assert!(limits::MAX_METADATA_BYTES > 0);
+        assert!(limits::MAX_ISO20022_PAYLOAD_BYTES > 0);
+        assert!(limits::MAX_SETTLEMENT_LEGS > 0);
     }
 }

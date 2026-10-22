@@ -3,8 +3,9 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import yaml from "js-yaml";
+import helmet from "helmet";
 
-import { resolvers } from "../../graphql/src/resolvers";
+import { EVENT_LOGGED, pubsub, resolvers } from "../../graphql/src/resolvers";
 import {
   export_events,
   exportCsv,
@@ -14,7 +15,7 @@ import {
   ExportFilter,
 } from "./export";
 import { validateKey, generateKey, revokeKey, listKeys, type Role } from "./keys";
-import { decodeCursor, encodeCursor, setPaginationHeaders, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./pagination";
+import { decodeCursor, encodeCursor, setPaginationHeaders } from "./pagination";
 import {
   securityHeaders,
   cspMiddleware,
@@ -29,12 +30,81 @@ import {
   type Algorithm,
 } from "@audit-ledger/security";
 import { authorizationServer, OAUTH_ISSUER, wafRuleEngine, createConfiguredRateLimitStore } from "./security";
+import { createComplianceRouter } from "./compliance";
+
+import { createReplayRouter } from "./replay";
+import { createConfidentialRouter } from "./confidential";
+import { createAggregationRouter } from "./aggregation";
+
+
+import {
+  createCacheStore,
+  createCacheBackedMiddleware,
+  warmEventCache,
+  invalidateEventCache,
+} from "./eventCache";
 
 const app = express();
+app.disable("x-powered-by");
 const port = process.env.PORT || 3002;
 
 app.use(cors());
 app.use(express.json());
+
+// ── Baseline security headers (ZAP 10055 / 10063 / 10037 / 10049) ───────────
+// - Content-Security-Policy with default-src fallback (fixes 10055)
+// - Permissions-Policy header (fixes 10063)
+// - Removes X-Powered-By (fixes 10037, also covered by app.disable above)
+// - Cache-Control hardening for storable/cacheable content (fixes 10049)
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        fontSrc: ["'self'", "https:", "data:"],
+        formAction: ["'self'"],
+        frameAncestors: ["'self'"],
+        imgSrc: ["'self'", "data:"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'"],
+        scriptSrcAttr: ["'none'"],
+        styleSrc: ["'self'", "https:", "'unsafe-inline'"],
+        upgradeInsecureRequests: [],
+      },
+    },
+    crossOriginEmbedderPolicy: true,
+    crossOriginOpenerPolicy: true,
+    crossOriginResourcePolicy: { policy: "same-origin" },
+    referrerPolicy: { policy: "no-referrer" },
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+    noSniff: true,
+    frameguard: { action: "deny" },
+    hidePoweredBy: true,
+  })
+);
+
+app.use((_req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+  );
+  next();
+});
+
+// ── Cross-Origin isolation headers (COEP / COOP / CORP) ─────────────────────
+// ZAP baseline flags missing/invalid Cross-Origin-Embedder-Policy,
+// Cross-Origin-Opener-Policy, and Cross-Origin-Resource-Policy headers.
+// These are set globally so every response (including /, /robots.txt,
+// /sitemap.xml, and API routes) carries them.
+
+app.use((_req, res, next) => {
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  next();
+});
 
 // ── Security headers + CSP (nonces, report-only mode, violation reporting) ─
 
@@ -46,6 +116,18 @@ app.use(
     reportToGroup: "csp-endpoint",
   })
 );
+
+// ZAP baseline: ensure Permissions-Policy is always present and CSP has
+// fallbacks for directives that would otherwise inherit from default-src.
+app.use((_req, res, next) => {
+  if (!res.getHeader("Permissions-Policy")) {
+    res.setHeader(
+      "Permissions-Policy",
+      "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+    );
+  }
+  next();
+});
 
 const cspViolationStore = new ViolationReportStore();
 app.post(
@@ -89,6 +171,26 @@ app.use(
   })
 );
 
+// ZAP 10049: prevent caching of dynamic API responses. Static assets are
+// served by the frontend; every REST response here is user- or
+// state-dependent, so mark it non-storable and non-cacheable.
+app.use((_req, res, next) => {
+  if (!res.getHeader("Cache-Control")) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0");
+  }
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
+// ── Per-client quotas with token-bucket burst handling (#444) ────────────────
+// On top of the global limiter above, each client (API key role, explicit
+// x-quota-tier header, or "default") gets its own token bucket with burst
+// headroom. Buckets live in the same shared store, so quotas coordinate
+// across instances when RATE_LIMIT_BACKEND=redis-cluster.
+
+app.use("/v1", createClientQuotaMiddleware(rateLimitStore));
+
 // ── OAuth2 / OIDC ────────────────────────────────────────────────────────────
 // Mounts /oauth/{authorize,token,jwks.json,introspect,revoke} and the
 // discovery documents. See src/security.ts for client registration and for
@@ -118,6 +220,11 @@ v1Admin.delete("/keys/:key", requireScopes(["admin:keys"]), requireRole("admin")
 v1Admin.use("/waf", requireScopes(["admin:waf"]), requireRole("admin"), wafAdminRouter(wafRuleEngine));
 
 app.use("/v1/admin", v1Admin);
+app.use("/v1", createComplianceRouter());
+app.use("/v1", createReplayRouter());
+app.use("/v1", createConfidentialRouter());
+app.use("/v1", createAggregationRouter());
+
 
 function resolveContext(req: express.Request): { apiKey?: string; role?: Role } {
   const apiKey = (req.headers["x-api-key"] ?? req.headers["authorization"]?.replace("Bearer ", "")) as string | undefined;
@@ -126,15 +233,36 @@ function resolveContext(req: express.Request): { apiKey?: string; role?: Role } 
   return record ? { apiKey, role: record.role } : {};
 }
 
-function parseLimit(raw: string | undefined): number {
-  const parsed = parseInt(raw ?? "", 10);
-  if (Number.isNaN(parsed) || parsed <= 0) return DEFAULT_PAGE_SIZE;
-  return Math.min(parsed, MAX_PAGE_SIZE);
-}
-
 // ── Health Check Endpoints (#268) ─────────────────────────────────────────────
 
 const startTime = Date.now();
+
+// Ensure every response (including static-ish endpoints below) carries the
+// baseline hardening headers ZAP flags: no X-Powered-By, a Permissions-Policy,
+// and explicit no-store caching for dynamic content.
+app.use((_req, res, next) => {
+  res.removeHeader("X-Powered-By");
+  res.setHeader("Permissions-Policy", "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()");
+  next();
+});
+
+app.get(["/", "/robots.txt", "/sitemap.xml"], (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  if (req.path === "/robots.txt") {
+    return res.type("text/plain").send("User-agent: *\nDisallow: /");
+  }
+  if (req.path === "/sitemap.xml") {
+    return res
+      .type("application/xml")
+      .send('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>');
+  }
+  return res.json({ status: "ok", name: "AuditLedger REST API", version: "v1" });
+});
 
 app.get("/healthz", (_req, res) => {
   res.json({
@@ -185,6 +313,30 @@ app.get("/metrics", (_req, res) => {
   res.send(lines.join("\n"));
 });
 
+// ── Distributed event cache (#443) ───────────────────────────────────────────
+// Backed by memory (default), Redis/Redis Cluster, or Memcached — selected via
+// CACHE_BACKEND / REDIS_URL / REDIS_CLUSTER_ENDPOINTS / MEMCACHED_SERVERS.
+
+const eventCacheStore = createCacheStore();
+
+app.use(createCacheBackedMiddleware(eventCacheStore));
+
+app.get("/v1/cache", async (_req, res) => {
+  const health = await eventCacheStore.health();
+  res.json({
+    data: {
+      backend: eventCacheStore.name,
+      status: health.ok ? "ok" : "degraded",
+      latencyMs: health.latencyMs,
+    },
+  });
+});
+
+app.post("/v1/cache/invalidate", async (_req, res) => {
+  const removed = await invalidateEventCache(eventCacheStore);
+  res.json({ data: { message: "Cache invalidated successfully", removed } });
+});
+
 // ── Version Middleware (#271) ─────────────────────────────────────────────────
 
 const SUPPORTED_VERSIONS = ["v1"];
@@ -195,35 +347,102 @@ app.use((req, res, next) => {
   res.setHeader("X-API-Version", LATEST_VERSION);
   res.setHeader("X-Supported-Versions", SUPPORTED_VERSIONS.join(", "));
 
-  const versionHeader = req.headers["accept-version"] as string | undefined;
-  const urlMatch = req.path.match(/^\/(v\d+)\//);
+const versionRegistry = versionRegistryFromEnv();
 
-  let requestedVersion = versionHeader ?? urlMatch?.[1] ?? LATEST_VERSION;
+app.use(
+  createVersioningMiddleware({
+    registry: versionRegistry,
+    migrationGuideUrl: "https://github.com/daddygokings-art/Decentralized-Audit-Transparency-Ledger/blob/master/docs/api-versioning.md",
+  })
+);
 
-  if (DEPRECATED_VERSIONS[requestedVersion]) {
-    res.setHeader("Deprecation", "true");
-    res.setHeader("Sunset", DEPRECATED_VERSIONS[requestedVersion]);
-    res.setHeader("X-Deprecation-Notice", `API version ${requestedVersion} is deprecated. Use ${LATEST_VERSION}.`);
-  }
-
-  (req as express.Request & { apiVersion?: string }).apiVersion = requestedVersion;
-  next();
-});
+app.get("/versions", versionsHandler(versionRegistry));
 
 // ── Versioned Routes (#271) ───────────────────────────────────────────────────
 
 const v1 = express.Router();
+const webhookAdmin = [bearerAuth, requireScopes(["admin:webhooks"]), requireRole("admin")];
+
+// Webhook management and testing (#435)
+v1.get("/webhooks", ...webhookAdmin, (_req, res) => {
+  res.json({ data: listWebhooks() });
+});
+
+v1.post("/webhooks", ...webhookAdmin, (req, res) => {
+  const { url, secret, eventTypes } = req.body ?? {};
+  if (!url || !secret) return res.status(400).json({ error: "url and secret are required" });
+  try {
+    const webhook = registerWebhook({ url, secret, eventTypes });
+    res.status(201).json({ data: { ...webhook, secret: "[redacted]" } });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "invalid webhook" });
+  }
+});
+
+v1.delete("/webhooks/:id", ...webhookAdmin, (req, res) => {
+  if (!removeWebhook(req.params.id)) return res.status(404).json({ error: "webhook not found" });
+  res.status(204).end();
+});
+
+v1.post("/webhooks/:id/test", ...webhookAdmin, async (req, res) => {
+  const webhook = getWebhook(req.params.id);
+  if (!webhook) return res.status(404).json({ error: "webhook not found" });
+  const event = {
+    id: `test-${Date.now()}`,
+    event_type: "webhook_test",
+    timestamp: Math.floor(Date.now() / 1000),
+  };
+  const delivery = await deliverWebhook(webhook, event);
+  res.status(delivery.status === "delivered" ? 200 : 502).json({ data: delivery });
+});
+
+v1.post("/webhooks/verify", (req, res) => {
+  const { secret, body, signature, timestamp } = req.body ?? {};
+  if (typeof secret !== "string" || typeof body !== "string" || typeof signature !== "string" || !Number.isInteger(timestamp)) {
+    return res.status(400).json({ error: "secret, body, signature, and integer timestamp are required" });
+  }
+  const result = verifySignature({ secret, body, signature, timestamp });
+  res.status(result.valid ? 200 : 401).json(result);
+});
+
+
+const eventFilterValidator = getRequestValidator("eventFilter");
+
+function parseEventFilter(value: string | undefined): EventFilter | null | undefined {
+  if (!value) return null;
+
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return eventFilterValidator(parsed) ? (parsed as EventFilter) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function filterValidationError() {
+  return {
+    error: {
+      code: "VALIDATION_ERROR",
+      message: "Invalid query parameters",
+      details: [{ field: "filter", message: "must be a valid event filter object" }],
+    },
+  };
+}
 
 // GET /events - List all events with pagination
-v1.get("/events", (req, res) => {
-  const limit = parseLimit(req.query.limit as string);
-  const filter = req.query.filter ? JSON.parse(req.query.filter as string) : null;
+v1.get("/events", validateQuery("eventListQuery"), validateResponse("eventListResponse"), (req, res) => {
+  const query = res.locals.validatedQuery as EventListQuery;
+  const filter = parseEventFilter(query.filter);
+  if (filter === undefined) {
+    return res.status(400).json(filterValidationError());
+  }
 
-  let offset = 0;
-  if (req.query.cursor) {
-    const decoded = decodeCursor(req.query.cursor as string);
+  const limit = query.limit;
+  let offset = query.offset;
+  if (query.cursor) {
+    const decoded = decodeCursor(query.cursor);
     if (!decoded) {
-      return res.status(400).json({ error: "Invalid cursor" });
+      return problem(res, 400, "Invalid cursor", "cursor is malformed or unsupported");
     }
     offset = decoded.index;
   }
@@ -236,59 +455,128 @@ v1.get("/events", (req, res) => {
   const prevCursor = offset > 0 ? encodeCursor(Math.max(0, offset - limit)) : null;
 
   setPaginationHeaders(res, "/events", total, limit, offset, nextCursor, prevCursor);
-  res.json({ data: result });
+  res.json({ data: result, total, limit, offset });
+});
+
+v1.get("/events/stream", async (req, res) => {
+  type StreamEvent = {
+    index: number;
+    timestamp: number;
+    event_type: string;
+    submitter: string;
+    [key: string]: unknown;
+  };
+
+  const type = typeof req.query.type === "string" ? req.query.type : undefined;
+  const submitter = typeof req.query.submitter === "string" ? req.query.submitter : undefined;
+  const startTimeValue = Number.parseInt(String(req.query.startTime ?? ""), 10);
+  const endTimeValue = Number.parseInt(String(req.query.endTime ?? ""), 10);
+  const startTime = Number.isFinite(startTimeValue) ? startTimeValue : undefined;
+  const endTime = Number.isFinite(endTimeValue) ? endTimeValue : undefined;
+  const requestedId = Number.parseInt(String(req.get("Last-Event-ID") ?? req.query.afterIndex ?? "-1"), 10);
+  let lastSentIndex = Number.isFinite(requestedId) ? requestedId : -1;
+  let closed = false;
+
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  const matches = (event: StreamEvent): boolean => {
+    if (type !== undefined && event.event_type !== type) return false;
+    if (submitter !== undefined && !event.submitter.includes(submitter)) return false;
+    if (startTime !== undefined && event.timestamp < startTime) return false;
+    if (endTime !== undefined && event.timestamp > endTime) return false;
+    return true;
+  };
+
+  const send = (event: StreamEvent): void => {
+    if (closed || event.index <= lastSentIndex || !matches(event)) return;
+    lastSentIndex = event.index;
+    res.write(`id: ${event.index}\nevent: event_logged\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+
+  const iterator = pubsub.asyncIterableIterator(EVENT_LOGGED);
+  const heartbeat = setInterval(() => {
+    if (!closed) res.write(": keep-alive\n\n");
+  }, 15000);
+
+  res.on("close", () => {
+    closed = true;
+    clearInterval(heartbeat);
+    void iterator.return?.();
+  });
+
+  try {
+    const filter = { type, submitter, startTime, endTime };
+    const initialEvents = resolvers.Query.events(null, { limit: 100000, offset: 0, filter }) as unknown as StreamEvent[];
+    initialEvents.forEach(send);
+
+    for await (const payload of iterator) {
+      const event = (payload as { eventLogged?: StreamEvent }).eventLogged;
+      if (event) send(event);
+    }
+  } catch (error) {
+    if (!closed) {
+      res.status(500).end(error instanceof Error ? error.message : "event stream failed");
+    }
+  }
 });
 
 // GET /events/:index - Get event by index
-v1.get("/events/:index", (req, res) => {
-  const index = parseInt(req.params.index);
-  if (isNaN(index) || index < 0) {
-    return res.status(400).json({ error: "index must be a non-negative integer" });
-  }
-
-  const ctx = resolveContext(req);
-  const result = resolvers.Query.event(null, { index }, ctx);
+v1.get(
+  "/events/:index",
+  validateParams("eventIndexParams"),
+  validateResponse("eventResponse"),
+  (req, res) => {
+    const { index } = res.locals.validatedParams as EventIndexParams;
+    const ctx = resolveContext(req);
+    const result = resolvers.Query.event(null, { index }, ctx);
 
     if (!result) {
-      return res.status(404).json({
-        error: {
-          code: "NOT_FOUND",
-          message: `Event with index ${index} not found`,
-        },
-      });
+      return problem(res, 404, "Event not found", `event with index ${index} was not found`);
     }
     res.json({ data: result });
   }
 );
 
 // GET /events/type/:type - Get events by type with pagination
-v1.get("/events/type/:type", (req, res) => {
-  const type = req.params.type;
-  const limit = parseLimit(req.query.limit as string);
+v1.get(
+  "/events/type/:type",
+  validateParams("eventTypeParams"),
+  validateQuery("eventTypeQuery"),
+  validateResponse("eventListResponse"),
+  (req, res) => {
+    const { type } = res.locals.validatedParams as EventTypeParams;
+    const query = res.locals.validatedQuery as EventTypeQuery;
+    const limit = query.limit;
+    let offset = query.offset;
 
-  let offset = 0;
-  if (req.query.cursor) {
-    const decoded = decodeCursor(req.query.cursor as string);
-    if (!decoded) {
-      return res.status(400).json({ error: "Invalid cursor" });
+    if (query.cursor) {
+      const decoded = decodeCursor(query.cursor);
+      if (!decoded) {
+        return res.status(400).json({ error: "Invalid cursor" });
+      }
+      offset = decoded.index;
     }
-    offset = decoded.index;
+
+    const ctx = resolveContext(req);
+    const allByType = Array.from({ length: 1000 }, (_, i) => i)
+      .map((typeIndex) => resolvers.Query.eventByType(null, { type, typeIndex }, ctx))
+      .filter(Boolean);
+
+    const total = allByType.length;
+    const result = allByType.slice(offset, offset + limit);
+
+    const nextCursor = offset + limit < total ? encodeCursor(offset + limit) : null;
+    const prevCursor = offset > 0 ? encodeCursor(Math.max(0, offset - limit)) : null;
+
+    setPaginationHeaders(res, `/events/type/${type}`, total, limit, offset, nextCursor, prevCursor);
+    res.json({ data: result, total, limit, offset });
   }
-
-  const ctx = resolveContext(req);
-  const allByType = Array.from({ length: 1000 }, (_, i) => i)
-    .map((typeIndex) => resolvers.Query.eventByType(null, { type, typeIndex }, ctx))
-    .filter(Boolean);
-
-  const total = allByType.length;
-  const result = allByType.slice(offset, offset + limit);
-
-  const nextCursor = offset + limit < total ? encodeCursor(offset + limit) : null;
-  const prevCursor = offset > 0 ? encodeCursor(Math.max(0, offset - limit)) : null;
-
-  setPaginationHeaders(res, `/events/type/${type}`, total, limit, offset, nextCursor, prevCursor);
-  res.json({ data: result });
-});
+);
 
 // GET /stats - Get statistics
 v1.get("/stats", (req, res) => {
@@ -418,6 +706,11 @@ v1.get("/export/progress", (_req, res) => {
 
 app.use("/v1", v1);
 
+// Deprecated legacy version (#445): v0 stays alive and fully served by the
+// same v1 routes until its scheduled sunset, so old clients keep working
+// while the deprecation window runs (see /versions and docs/api-versioning.md).
+app.use("/v0", v1);
+
 // Legacy unversioned routes (redirect to v1)
 app.get("/events", (req, res) => {
   res.redirect(301, `/v1/events${req.url.includes("?") ? "?" + req.url.split("?")[1] : ""}`);
@@ -432,6 +725,15 @@ app.get("/stats", (_req, res) => {
   res.redirect(301, "/v1/stats");
 });
 
+// Consistent JSON errors for malformed requests and unexpected failures.
+app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (error instanceof SyntaxError && "body" in error) {
+    return problem(res, 400, "Malformed JSON", "request body must contain valid JSON");
+  }
+  console.error("Unhandled REST error", error);
+  return problem(res, 500, "Internal Server Error", "an unexpected error occurred");
+});
+
 if (require.main === module) {
   app.listen(port, () => {
     console.log(`REST API listening on port ${port}`);
@@ -441,7 +743,25 @@ if (require.main === module) {
     console.log(`  Export:    /v1/export/events.{json,csv}, /v1/export/events/stream`);
     console.log(`  OAuth2:    /oauth/{authorize,token,jwks.json}, /.well-known/openid-configuration`);
     console.log(`  Admin:     /v1/admin/{keys,waf} (requires admin role + scope)`);
+    console.log(`  Cache:     /v1/cache${eventCacheStore.name !== "memory" ? ` (backend: ${eventCacheStore.name})` : " (memory)"}`);
   });
 }
+
+// Warm the cache with the most popular queries so the first real caller gets a
+// HIT instead of paying the cold path (#443).
+void warmEventCache(eventCacheStore, [
+  {
+    key: "/v1/stats",
+    value: JSON.stringify({ data: resolvers.Query.statistics(null, {}, null) }),
+  },
+  {
+    key: "/v1/events",
+    value: JSON.stringify({
+      data: resolvers.Query.events(null, { limit: DEFAULT_PAGE_SIZE, offset: 0, filter: null }),
+    }),
+  },
+]).catch(() => {
+  // Warming must never prevent the API from booting.
+});
 
 export { app };
