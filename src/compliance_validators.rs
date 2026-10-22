@@ -85,9 +85,7 @@ impl ISA3000Validator {
         // CC6.1: Segregation of Duties
         objectives.push_back(ISA3000Rule {
             control_code: Symbol::new(env, "CC6.1"),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"Segregation of duties to prevent unauthorized access and fraud",
-            ).unwrap(),
+            description: Bytes::from_slice(env, b"Segregation of duties to prevent unauthorized access and fraud",),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "access_grant"));
@@ -101,9 +99,7 @@ impl ISA3000Validator {
         // CC6.2: Exception handling
         objectives.push_back(ISA3000Rule {
             control_code: Symbol::new(env, "CC6.2"),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"System-generated exception reports and monitoring",
-            ).unwrap(),
+            description: Bytes::from_slice(env, b"System-generated exception reports and monitoring",),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "exception_report"));
@@ -117,9 +113,7 @@ impl ISA3000Validator {
         // CC7.1: Prevention of unauthorized changes
         objectives.push_back(ISA3000Rule {
             control_code: Symbol::new(env, "CC7.1"),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"Prevention and detection of unauthorized changes to systems",
-            ).unwrap(),
+            description: Bytes::from_slice(env, b"Prevention and detection of unauthorized changes to systems",),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "change_log"));
@@ -133,9 +127,7 @@ impl ISA3000Validator {
         // CC9.1: Monitoring and reconciliation
         objectives.push_back(ISA3000Rule {
             control_code: Symbol::new(env, "CC9.1"),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"Monitoring and reconciliation of system activity",
-            ).unwrap(),
+            description: Bytes::from_slice(env, b"Monitoring and reconciliation of system activity",),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "reconciliation"));
@@ -149,9 +141,7 @@ impl ISA3000Validator {
         // A1.1: Authorization and access control
         objectives.push_back(ISA3000Rule {
             control_code: Symbol::new(env, "A1.1"),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"Authorization and access control policies are established and enforced",
-            ).unwrap(),
+            description: Bytes::from_slice(env, b"Authorization and access control policies are established and enforced",),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "policy_document"));
@@ -185,11 +175,10 @@ impl ISA3000Validator {
         if target_rule.is_none() {
             let mut issues = Vec::new(env);
             issues.push_back(
-                Bytes::new(env).try_extend_from_slice(b"Control code not found")
-                    .unwrap()
+                Bytes::from_slice(env, b"Control code not found")
             );
             return ControlValidationResult {
-                control_code: *control_code,
+                control_code: control_code.clone(),
                 operating_effectively: false,
                 evidence_count: 0,
                 sufficient_evidence: false,
@@ -201,7 +190,7 @@ impl ISA3000Validator {
         let sufficient = actual_evidence_count >= rule.min_evidence_count;
 
         ControlValidationResult {
-            control_code: *control_code,
+            control_code: control_code.clone(),
             operating_effectively: sufficient && !evidence_events.is_empty(),
             evidence_count: actual_evidence_count,
             sufficient_evidence: sufficient,
@@ -211,7 +200,7 @@ impl ISA3000Validator {
 
     /// Calculate ISA 3000 compliance score
     pub fn calculate_compliance_score(
-        env: &Env,
+        _env: &Env,
         controls_tested: u32,
         controls_operating: u32,
     ) -> u32 {
@@ -251,10 +240,8 @@ impl SOC2Validator {
         // CC6.1 - Logical and Physical Access Controls
         criteria.push_back(SOC2Rule {
             criterion_code: Symbol::new(env, "CC6.1"),
-            principle: Bytes::new(env).try_extend_from_slice(b"Security").unwrap(),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"Logical and physical access controls protect system resources"
-            ).unwrap(),
+            principle: Bytes::from_slice(env, b"Security"),
+            description: Bytes::from_slice(env, b"Logical and physical access controls protect system resources"),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "access_control"));
@@ -267,10 +254,8 @@ impl SOC2Validator {
         // CC6.2 - Identity Verification
         criteria.push_back(SOC2Rule {
             criterion_code: Symbol::new(env, "CC6.2"),
-            principle: Bytes::new(env).try_extend_from_slice(b"Security").unwrap(),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"Prior to issuing system credentials, identity and access rights are verified"
-            ).unwrap(),
+            principle: Bytes::from_slice(env, b"Security"),
+            description: Bytes::from_slice(env, b"Prior to issuing system credentials, identity and access rights are verified"),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "identity_verification"));
@@ -283,10 +268,8 @@ impl SOC2Validator {
         // CC7.1 - Change Management
         criteria.push_back(SOC2Rule {
             criterion_code: Symbol::new(env, "CC7.1"),
-            principle: Bytes::new(env).try_extend_from_slice(b"Security").unwrap(),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"Changes to the objectives and responsibilities for IT and related processes are managed"
-            ).unwrap(),
+            principle: Bytes::from_slice(env, b"Security"),
+            description: Bytes::from_slice(env, b"Changes to the objectives and responsibilities for IT and related processes are managed"),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "change_request"));
@@ -305,10 +288,8 @@ impl SOC2Validator {
 
         criteria.push_back(SOC2Rule {
             criterion_code: Symbol::new(env, "A1.1"),
-            principle: Bytes::new(env).try_extend_from_slice(b"Availability").unwrap(),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"The entity maintains and monitors commitments and responsibilities for availability"
-            ).unwrap(),
+            principle: Bytes::from_slice(env, b"Availability"),
+            description: Bytes::from_slice(env, b"The entity maintains and monitors commitments and responsibilities for availability"),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "uptime_report"));
@@ -327,10 +308,8 @@ impl SOC2Validator {
 
         criteria.push_back(SOC2Rule {
             criterion_code: Symbol::new(env, "PI1.1"),
-            principle: Bytes::new(env).try_extend_from_slice(b"Processing Integrity").unwrap(),
-            description: Bytes::new(env).try_extend_from_slice(
-                b"The entity maintains and monitors commitments and responsibilities for processing integrity"
-            ).unwrap(),
+            principle: Bytes::from_slice(env, b"Processing Integrity"),
+            description: Bytes::from_slice(env, b"The entity maintains and monitors commitments and responsibilities for processing integrity"),
             required_evidence_types: {
                 let mut v = Vec::new(env);
                 v.push_back(Symbol::new(env, "transaction_log"));
@@ -347,13 +326,17 @@ impl SOC2Validator {
     pub fn validate_criterion(
         env: &Env,
         criterion_code: &Symbol,
-        principle: &Bytes,
+        _principle: &Bytes,
         actual_evidence_count: u32,
     ) -> ControlValidationResult {
         // Combine all criteria
         let mut all_criteria = Self::get_security_criteria(env);
-        all_criteria.try_extend_from_slice(&Self::get_availability_criteria(env)).ok();
-        all_criteria.try_extend_from_slice(&Self::get_processing_integrity_criteria(env)).ok();
+        for c in Self::get_availability_criteria(env).iter() {
+            all_criteria.push_back(c);
+        }
+        for c in Self::get_processing_integrity_criteria(env).iter() {
+            all_criteria.push_back(c);
+        }
 
         let mut target_rule: Option<SOC2Rule> = None;
         for criterion in all_criteria.iter() {
@@ -366,11 +349,10 @@ impl SOC2Validator {
         if target_rule.is_none() {
             let mut issues = Vec::new(env);
             issues.push_back(
-                Bytes::new(env).try_extend_from_slice(b"Criterion not found")
-                    .unwrap()
+                Bytes::from_slice(env, b"Criterion not found")
             );
             return ControlValidationResult {
-                control_code: *criterion_code,
+                control_code: criterion_code.clone(),
                 operating_effectively: false,
                 evidence_count: 0,
                 sufficient_evidence: false,
@@ -382,7 +364,7 @@ impl SOC2Validator {
         let sufficient = actual_evidence_count >= rule.min_evidence_count;
 
         ControlValidationResult {
-            control_code: *criterion_code,
+            control_code: criterion_code.clone(),
             operating_effectively: sufficient,
             evidence_count: actual_evidence_count,
             sufficient_evidence: sufficient,
@@ -392,7 +374,7 @@ impl SOC2Validator {
 
     /// Calculate SOC2 compliance score
     pub fn calculate_compliance_score(
-        env: &Env,
+        _env: &Env,
         criteria_tested: u32,
         criteria_operating: u32,
     ) -> u32 {

@@ -3,8 +3,7 @@
 //! Implements cryptographic chain verification to detect tampering,
 //! prove event immutability, and validate audit trail integrity.
 
-use soroban_sdk::{contracttype, BytesN, Env};
-use crate::regulator::TamperProof;
+use soroban_sdk::{contracttype, BytesN, Env, Vec};
 
 /// Result of a chain verification operation
 #[contracttype]
@@ -112,7 +111,7 @@ impl TamperEvidenceHelper {
     pub fn verify_chain_link(
         current_event_hash: &BytesN<32>,
         current_prev_hash: &BytesN<32>,
-        next_event_hash: &BytesN<32>,
+        _next_event_hash: &BytesN<32>,
         next_prev_hash: &BytesN<32>,
     ) -> bool {
         // The current event's hash should match next event's prev_hash
@@ -144,7 +143,7 @@ impl TamperEvidenceHelper {
 
         ImmutabilityProof {
             event_index,
-            event_hash: BytesN::<32>::from_array([0u8; 32]),
+            event_hash: BytesN::<32>::from_array(&Env::default(), &[0u8; 32]),
             references: chain_length,
             chain_length,
             immutable,
@@ -161,7 +160,7 @@ impl TamperEvidenceHelper {
             event_index,
             root_at_index,
             timestamp: env.ledger().timestamp(),
-            commitment_hash: BytesN::<32>::from_array([0u8; 32]),
+            commitment_hash: BytesN::<32>::from_array(&Env::default(), &[0u8; 32]),
         }
     }
 
@@ -203,7 +202,7 @@ impl TamperEvidenceHelper {
         references: &Vec<BytesN<32>>,
     ) -> bool {
         // All references should match the original event hash
-        references.iter().all(|ref_hash| ref_hash == event_hash)
+        references.iter().all(|ref_hash| ref_hash == *event_hash)
     }
 
     /// Create proof that event is immutable by archive
@@ -215,8 +214,8 @@ impl TamperEvidenceHelper {
         let valid = !merkle_path.is_empty();
 
         ArchiveProof {
-            event_hash: *event_hash,
-            archive_root: *archive_root,
+            event_hash: event_hash.clone(),
+            archive_root: archive_root.clone(),
             merkle_path,
             valid,
         }
@@ -236,15 +235,15 @@ mod tests {
 
     #[test]
     fn test_verify_event_hash_match() {
-        let hash = BytesN::<32>::from_array([1u8; 32]);
-        let expected = BytesN::<32>::from_array([1u8; 32]);
+        let hash = BytesN::<32>::from_array(&Env::default(), &[1u8; 32]);
+        let expected = BytesN::<32>::from_array(&Env::default(), &[1u8; 32]);
         assert!(TamperEvidenceHelper::verify_event_hash(&hash, &expected));
     }
 
     #[test]
     fn test_verify_event_hash_mismatch() {
-        let hash = BytesN::<32>::from_array([1u8; 32]);
-        let expected = BytesN::<32>::from_array([2u8; 32]);
+        let hash = BytesN::<32>::from_array(&Env::default(), &[1u8; 32]);
+        let expected = BytesN::<32>::from_array(&Env::default(), &[2u8; 32]);
         assert!(!TamperEvidenceHelper::verify_event_hash(&hash, &expected));
     }
 
@@ -297,10 +296,10 @@ mod tests {
     #[test]
     fn test_no_retroactive_modification() {
         let env = Env::default();
-        let hash = BytesN::<32>::from_array([1u8; 32]);
+        let hash = BytesN::<32>::from_array(&Env::default(), &[1u8; 32]);
         let mut references = Vec::new(&env);
-        references.push_back(BytesN::<32>::from_array([1u8; 32]));
-        references.push_back(BytesN::<32>::from_array([1u8; 32]));
+        references.push_back(BytesN::<32>::from_array(&Env::default(), &[1u8; 32]));
+        references.push_back(BytesN::<32>::from_array(&Env::default(), &[1u8; 32]));
 
         assert!(TamperEvidenceHelper::verify_no_retroactive_modification(&hash, &references));
     }
@@ -308,10 +307,10 @@ mod tests {
     #[test]
     fn test_retroactive_modification_detected() {
         let env = Env::default();
-        let hash = BytesN::<32>::from_array([1u8; 32]);
+        let hash = BytesN::<32>::from_array(&Env::default(), &[1u8; 32]);
         let mut references = Vec::new(&env);
-        references.push_back(BytesN::<32>::from_array([1u8; 32]));
-        references.push_back(BytesN::<32>::from_array([2u8; 32])); // Mismatch!
+        references.push_back(BytesN::<32>::from_array(&Env::default(), &[1u8; 32]));
+        references.push_back(BytesN::<32>::from_array(&Env::default(), &[2u8; 32])); // Mismatch!
 
         assert!(!TamperEvidenceHelper::verify_no_retroactive_modification(&hash, &references));
     }

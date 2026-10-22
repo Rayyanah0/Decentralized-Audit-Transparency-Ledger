@@ -8,6 +8,50 @@ import { BatchSigner } from './batch-signing';
 /** Transport function type: sends a Soroban RPC method call and returns the result. */
 export type Transport = (method: string, params: unknown[]) => Promise<unknown>;
 
+/** Maximum number of items a single paginated query may return. */
+export const MAX_PAGE_SIZE = 100;
+
+/**
+ * Opaque cursor token for cursor-based pagination. `null`/`undefined` means
+ * "start from the beginning"; the value returned as `next_cursor` should be
+ * passed back verbatim to fetch the following page.
+ */
+export type PageCursor = string | null;
+
+/** Requested page size. Clamped to `[1, MAX_PAGE_SIZE]` by the client. */
+export type PageLimit = number;
+
+/** Status of a SupTech rule. */
+export type RuleStatus = 'Active' | 'Inactive' | 'Suspended' | 'Archived';
+
+/** Multi-predicate filter for SupTech rule queries. */
+export interface RuleQueryFilter {
+  /** Inclusive lower bound on the ledger timestamp. */
+  startTimestamp?: number;
+  /** Inclusive upper bound on the ledger timestamp. */
+  endTimestamp?: number;
+  /** Restrict results to a single rule status. */
+  status?: RuleStatus;
+  /** Restrict results to rules submitted by this address. */
+  submitter?: string;
+}
+
+/** A single SupTech rule record. */
+export interface Rule {
+  id: string;
+  status: RuleStatus;
+  submitter: string;
+  timestamp: number;
+  [key: string]: unknown;
+}
+
+/** A single page of SupTech rule query results. */
+export interface RulePage {
+  items: Rule[];
+  /** Token to pass as `cursor` for the next page, or `null` when exhausted. */
+  next_cursor: PageCursor;
+}
+
 export interface RetryOptions {
   maxRetries?: number;
   baseDelayMs?: number;
@@ -18,12 +62,91 @@ export interface BatchProgress {
   total: number;
 }
 
+/** Maximum number of items a single paginated query page may return. */
+export const MAX_PAGE_LIMIT = 100;
+
+/**
+ * Opaque cursor token for cursor-based pagination. `null`/`undefined` means
+ * "start from the beginning"; a returned cursor is passed back verbatim to
+ * fetch the next page.
+ */
+export type PageCursor = string | null;
+
+/** Filter predicates shared by the paginated FinOps / cross-contract queries. */
+export interface PageFilter {
+  /** Inclusive lower bound on ledger timestamp. */
+  startTimestamp?: number;
+  /** Inclusive upper bound on ledger timestamp. */
+  endTimestamp?: number;
+  /** Status enum value to match (e.g. 'pending' | 'success' | 'failed'). */
+  status?: string;
+  /** Submitter address to match. */
+  submitter?: string;
+}
+
+/** A single page of results plus the cursor for the following page. */
+export interface Page<T> {
+  items: T[];
+  /** Cursor to pass to the next call, or `null` when the last page was reached. */
+  next_cursor: PageCursor;
+}
+
+/** A FinOps storage-rent / compute-budget tracking record. */
+export interface FinOpsRecord {
+  id: string;
+  timestamp: number;
+  status: string;
+  submitter: string;
+  [key: string]: unknown;
+}
+
+/** A cross-contract atomic audit batch invocation record. */
+export interface CrossContractRecord {
+  id: string;
+  timestamp: number;
+  status: string;
+  submitter: string;
+  [key: string]: unknown;
+}
+
 export interface AuditLedgerClientOptions {
   retryOptions?: RetryOptions;
   /** Logging options (#237) */
   logging?: LoggerOptions;
   /** Validation options — pass an object to enable client-side validation (#232) */
   validation?: ValidatorOptions | false;
+}
+
+/** Maximum number of items a single paginated query may return (#852). */
+export const MAX_PAGE_LIMIT = 100;
+
+/** Opaque cursor token returned by paginated queries (#852). */
+export type PageCursor = string | null;
+
+/** Filter options shared by the paginated CBDC privacy queries (#852). */
+export interface PageFilterOptions {
+  /** Inclusive lower bound on ledger timestamp. */
+  startTimestamp?: number;
+  /** Inclusive upper bound on ledger timestamp. */
+  endTimestamp?: number;
+  /** Status enum value to filter by. */
+  status?: string;
+  /** Submitter address to filter by. */
+  submitter?: string;
+}
+
+/** Options accepted by paginated query methods (#852). */
+export interface PageQueryOptions extends PageFilterOptions {
+  /** Opaque cursor from a previous page; omit or pass null for the first page. */
+  cursor?: PageCursor;
+  /** Requested page size; clamped to MAX_PAGE_LIMIT. */
+  limit?: number;
+}
+
+/** A single page of results plus the cursor for the next page (#852). */
+export interface Page<T> {
+  items: T[];
+  next_cursor: PageCursor;
 }
 
 export class AuditLedgerClient {
@@ -202,7 +325,7 @@ export class AuditLedgerClient {
 
   async getEvents(offset = 0, limit = 50, cursor?: number): Promise<EventPage> {
     const start = cursor !== undefined ? Math.max(cursor, 0) : Math.max(offset, 0);
-    const safeLimit = Math.max(1, Math.min(limit, this.maxPageSize));
+    const safeLimit = Math.max(1, Math.min(limit, this.maxPageSize, MAX_PAGE_SIZE));
     const total = await this.totalEvents();
     const end = Math.min(start + safeLimit, total);
     const items: Event[] = [];
@@ -287,8 +410,199 @@ export class AuditLedgerClient {
     return this.callTransport('get_statistics', []);
   }
 
+  // ── Cursor-based pagination & filtered batch queries (#862 / #867) ────────
+
+  /**
+   * Clamp a requested page limit to the strict `MAX_PAGE_LIMIT` cap.
+   */
+  private clampPageLimit(limit?: number): number {
+    if (limit === undefined || !Number.isFinite(limit)) return MAX_PAGE_LIMIT;
+    return Math.max(1, Math.min(Math.floor(limit), MAX_PAGE_LIMIT));
+  }
+
+  /**
+   * Normalize filter options, dropping undefined fields so the transport
+   * payload stays deterministic across ledger upgrades / archival restores.
+   */
+  private normalizePageFilter(filter: PageFilter = {}): Record<string, unknown> {
+    const normalized: Record<string, unknown> = {};
+    if (filter.startTimestamp !== undefined) normalized.start_timestamp = filter.startTimestamp;
+    if (filter.endTimestamp !== undefined) normalized.end_timestamp = filter.endTimestamp;
+    if (filter.status !== undefined) normalized.status = filter.status;
+    if (filter.submitter !== undefined) normalized.submitter = filter.submitter;
+    return normalized;
+  }
+
+  /**
+   * Query FinOps storage-rent / compute-budget records with deterministic
+   * cursor-based pagination and multi-predicate filtering (#862).
+   *
+   * @param cursor  Cursor from a previous page, or `null` to start at the beginning.
+   * @param filter  Optional timestamp range / status / submitter predicates.
+   * @param limit   Requested page size; clamped to `MAX_PAGE_LIMIT` (100).
+   */
+  async queryFinOps(
+    cursor: PageCursor = null,
+    filter: PageFilter = {},
+    limit?: number,
+  ): Promise<Page<FinOpsRecord>> {
+    const pageLimit = this.clampPageLimit(limit);
+    const result = await this.callTransport<{ items: FinOpsRecord[]; next_cursor: PageCursor }>(
+      'query_finops',
+      [cursor, this.normalizePageFilter(filter), pageLimit],
+    );
+    return {
+      items: result.items ?? [],
+      next_cursor: result.next_cursor ?? null,
+    };
+  }
+
+  /**
+   * Query cross-contract atomic audit batch invocations with deterministic
+   * cursor-based pagination and multi-predicate filtering (#867).
+   *
+   * @param cursor  Cursor from a previous page, or `null` to start at the beginning.
+   * @param filter  Optional timestamp range / status / submitter predicates.
+   * @param limit   Requested page size; clamped to `MAX_PAGE_LIMIT` (100).
+   */
+  async queryCrossContract(
+    cursor: PageCursor = null,
+    filter: PageFilter = {},
+    limit?: number,
+  ): Promise<Page<CrossContractRecord>> {
+    const pageLimit = this.clampPageLimit(limit);
+    const result = await this.callTransport<{ items: CrossContractRecord[]; next_cursor: PageCursor }>(
+      'query_cross_contract',
+      [cursor, this.normalizePageFilter(filter), pageLimit],
+    );
+    return {
+      items: result.items ?? [],
+      next_cursor: result.next_cursor ?? null,
+    };
+  }
+
+  /**
+   * Exhaustively traverse every page of a FinOps query, invoking `onPage` for
+   * each page. Guards against non-advancing cursors to avoid infinite loops.
+   */
+  async queryFinOpsAll(
+    filter: PageFilter = {},
+    limit?: number,
+    onPage?: (page: Page<FinOpsRecord>) => void | Promise<void>,
+  ): Promise<FinOpsRecord[]> {
+    const pageLimit = this.clampPageLimit(limit);
+    const all: FinOpsRecord[] = [];
+    let cursor: PageCursor = null;
+    for (;;) {
+      const page = await this.queryFinOps(cursor, filter, pageLimit);
+      all.push(...page.items);
+      await onPage?.(page);
+      if (page.next_cursor === null || page.next_cursor === cursor) break;
+      cursor = page.next_cursor;
+    }
+    return all;
+  }
+
+  /**
+   * Exhaustively traverse every page of a cross-contract query, invoking
+   * `onPage` for each page. Guards against non-advancing cursors.
+   */
+  async queryCrossContractAll(
+    filter: PageFilter = {},
+    limit?: number,
+    onPage?: (page: Page<CrossContractRecord>) => void | Promise<void>,
+  ): Promise<CrossContractRecord[]> {
+    const pageLimit = this.clampPageLimit(limit);
+    const all: CrossContractRecord[] = [];
+    let cursor: PageCursor = null;
+    for (;;) {
+      const page = await this.queryCrossContract(cursor, filter, pageLimit);
+      all.push(...page.items);
+      await onPage?.(page);
+      if (page.next_cursor === null || page.next_cursor === cursor) break;
+      cursor = page.next_cursor;
+    }
+    return all;
+  }
+
   async getEventByOrder(order: number): Promise<Event> {
     return this.callTransport('get_event_by_order', [order]);
+  }
+
+  // ── SupTech rules: cursor-based pagination (#832) ───────────────────────
+
+  /** Clamp a requested page limit into `[1, MAX_PAGE_SIZE]`. */
+  private clampPageLimit(limit?: PageLimit): number {
+    if (limit === undefined || !Number.isFinite(limit)) return MAX_PAGE_SIZE;
+    return Math.max(1, Math.min(Math.floor(limit), MAX_PAGE_SIZE));
+  }
+
+  /**
+   * Query SupTech rules with multi-predicate filtering and deterministic
+   * cursor-based pagination. The returned `next_cursor` is `null` when the
+   * last page has been reached.
+   */
+  async queryRules(
+    filter: RuleQueryFilter = {},
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    const safeLimit = this.clampPageLimit(limit);
+    const result = await this.callTransport<RulePage>('query_rules', [
+      filter,
+      cursor,
+      safeLimit,
+    ]);
+    return {
+      items: result?.items ?? [],
+      next_cursor: result?.next_cursor ?? null,
+    };
+  }
+
+  /** Paginated query of rules filtered by ledger timestamp range. */
+  async queryRulesByTimeRange(
+    startTimestamp: number,
+    endTimestamp: number,
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    return this.queryRules({ startTimestamp, endTimestamp }, cursor, limit);
+  }
+
+  /** Paginated query of rules filtered by status. */
+  async queryRulesByStatus(
+    status: RuleStatus,
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    return this.queryRules({ status }, cursor, limit);
+  }
+
+  /** Paginated query of rules filtered by submitter address. */
+  async queryRulesBySubmitter(
+    submitter: string,
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    return this.queryRules({ submitter }, cursor, limit);
+  }
+
+  /**
+   * Iterate every rule matching `filter`, transparently following cursors.
+   * Yields individual rules and stops when the cursor is exhausted.
+   */
+  async *streamRules(
+    filter: RuleQueryFilter = {},
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): AsyncGenerator<Rule> {
+    const pageSize = this.clampPageLimit(limit);
+    let cursor: PageCursor = null;
+    for (;;) {
+      const page = await this.queryRules(filter, cursor, pageSize);
+      for (const rule of page.items) yield rule;
+      if (page.next_cursor === null || page.items.length === 0) return;
+      cursor = page.next_cursor;
+    }
   }
 
   async listEvents(offset: number, limit: number): Promise<Event[]> {
@@ -302,6 +616,80 @@ export class AuditLedgerClient {
     limit: number,
   ): Promise<Event[]> {
     return this.callTransport('get_events_by_time_range', [startTime, endTime, offset, limit]);
+  }
+
+  // ── #852 — Cursor-based pagination & filtered batch queries ─────────────
+
+  /** Clamp a requested page limit to the enforced maximum. */
+  private clampPageLimit(limit?: number): number {
+    if (limit === undefined || !Number.isFinite(limit)) return this.maxPageSize;
+    return Math.max(1, Math.min(Math.floor(limit), MAX_PAGE_LIMIT, this.maxPageSize));
+  }
+
+  /** Normalize filter options into the wire representation expected by the contract. */
+  private buildPageParams(options: PageQueryOptions): unknown[] {
+    const params: unknown[] = [options.cursor ?? null, this.clampPageLimit(options.limit)];
+    const filter: Record<string, unknown> = {};
+    if (options.startTimestamp !== undefined) filter.start_timestamp = options.startTimestamp;
+    if (options.endTimestamp !== undefined) filter.end_timestamp = options.endTimestamp;
+    if (options.status !== undefined) filter.status = options.status;
+    if (options.submitter !== undefined) filter.submitter = options.submitter;
+    params.push(filter);
+    return params;
+  }
+
+  /** Normalize a raw transport response into a `Page<T>`. */
+  private normalizePage<T>(raw: unknown): Page<T> {
+    if (Array.isArray(raw)) {
+      return { items: raw as T[], next_cursor: null };
+    }
+    const obj = (raw ?? {}) as { items?: T[]; next_cursor?: PageCursor };
+    return {
+      items: Array.isArray(obj.items) ? obj.items : [],
+      next_cursor: obj.next_cursor ?? null,
+    };
+  }
+
+  /** Paginated, filtered query over CBDC privacy records (#852). */
+  async queryPrivacyRecords<T = Event>(options: PageQueryOptions = {}): Promise<Page<T>> {
+    const raw = await this.callTransport<unknown>('query_privacy_records', this.buildPageParams(options));
+    return this.normalizePage<T>(raw);
+  }
+
+  /** Paginated, filtered query over disclosure requests (#852). */
+  async queryDisclosureRequests<T = Event>(options: PageQueryOptions = {}): Promise<Page<T>> {
+    const raw = await this.callTransport<unknown>('query_disclosure_requests', this.buildPageParams(options));
+    return this.normalizePage<T>(raw);
+  }
+
+  /** Paginated, filtered query over anonymity-tier records (#852). */
+  async queryAnonymityTiers<T = Event>(options: PageQueryOptions = {}): Promise<Page<T>> {
+    const raw = await this.callTransport<unknown>('query_anonymity_tiers', this.buildPageParams(options));
+    return this.normalizePage<T>(raw);
+  }
+
+  /**
+   * Traverse every page of a paginated query, invoking `onPage` for each page.
+   * Stops when `next_cursor` is null/undefined or when `maxPages` is reached.
+   */
+  async traversePrivacyRecords<T = Event>(
+    options: PageQueryOptions = {},
+    onPage: (page: Page<T>) => void | Promise<void>,
+    maxPages = Number.MAX_SAFE_INTEGER,
+  ): Promise<{ pages: number; items: number }> {
+    let cursor: PageCursor = options.cursor ?? null;
+    let pages = 0;
+    let items = 0;
+    for (;;) {
+      const page = await this.queryPrivacyRecords<T>({ ...options, cursor });
+      await onPage(page);
+      pages += 1;
+      items += page.items.length;
+      if (page.next_cursor === null || page.next_cursor === undefined) break;
+      cursor = page.next_cursor;
+      if (pages >= maxPages) break;
+    }
+    return { pages, items };
   }
 
   // ── Event replay (issue #238) ─────────────────────────────────────────

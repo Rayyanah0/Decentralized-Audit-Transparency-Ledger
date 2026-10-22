@@ -9,6 +9,7 @@ use crate::rwa_types::{
     AssetClass, ComplianceFramework, RwaConfig, RwaToken, TokenizationStatus,
 };
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
+use soroban_sdk::xdr::ToXdr;
 
 // ── Storage Key ───────────────────────────────────────────────────────────────
 

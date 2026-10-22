@@ -1,17 +1,32 @@
 #![no_std]
 // Migration to #[contractevent] macro is deferred (issue tracked separately)
 #![allow(deprecated)]
+// Guest-heap `alloc` is only linked for host test builds: the contract path avoids
+// it entirely, so the wasm build needs no `#[global_allocator]`.
+#[cfg(test)]
+#[macro_use]
+extern crate alloc;
 
 pub mod regulator;
 pub mod regulator_events;
 pub mod disclosure;
+// A Soroban WASM exposes a single contract interface, so this standalone
+// contract is opt-in: enabled for host tests and for feature-gated builds.
+#[cfg(any(test, feature = "contract-event-privacy"))]
+pub mod contract_event_privacy;
 pub mod data_sharing;
 pub mod tamper_evidence;
+pub mod rbac;
 pub mod compliance_validators;
 pub mod tax;
 pub mod vat_engine;
+pub mod rwa_custody;
+pub mod rwa_oracle;
 pub mod tax_engines;
 pub mod tax_audit_trail;
+pub mod dao_dispute_resolution;
+#[cfg(test)]
+pub mod test_data_factories;
 
 // ── Automated Regulatory Reporting ──────────────────────────────────────────
 pub mod regulatory_reporting;
@@ -29,18 +44,101 @@ mod regulator_tests;
 #[cfg(test)]
 mod regulatory_reporting_tests;
 
+#[cfg(test)]
+mod dao_dispute_resolution_tests;
+
 use soroban_sdk::{
-    bytes, contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env, Symbol,
+    bytes, contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env, String, Symbol,
     Vec,
 };
 
+pub mod rbac;
+pub mod cross_chain_bridge;
+
 pub mod supply_chain;
+// Fine-grained RBAC role gating shared by mutating modules (supply chain,
+// cross-contract router) and susbmitter suspension controls (issue #865).
+pub mod rbac;
 pub mod digital_passport;
 pub mod carbon_credits;
 pub mod esg_reporting;
+pub mod rbac;
+
+// Role-Based Access Control (#686 #689 #688 #687): granular roles with
+// precedence hierarchies shared by supply chain and ML feature store.
+pub mod rbac;
+
+// On-chain ML feature vector lineage and hash anchoring
+// (issues #854, #855, #857).
+pub mod ml_feature_store;
+
+#[cfg(test)]
+mod digital_passport_tests;
 
 // Data retention, legal hold, GDPR erasure, and the immutable operational audit log.
 pub mod data_retention;
+
+// Multi-region high-availability, replication, and disaster recovery.
+pub mod multi_region;
+
+// Predictive capacity planning, ML forecasting, and auto-scaling.
+pub mod capacity_planning;
+
+#[cfg(test)]
+mod digital_passport_invariant_tests;
+
+#[cfg(test)]
+mod capacity_planning_tests;
+
+// Operational runbook automation, validation, and execution auditing.
+pub mod runbook_automation;
+
+// Incident management, on-call rotations, escalation policies, and postmortems.
+pub mod incident_management;
+
+// Privacy-preserving analytics suite: DP, FL, SMPC, and HE (issue #528)
+// A Soroban WASM exposes a single contract interface, so this standalone
+// contract is opt-in: enabled for host tests and for feature-gated builds.
+#[cfg(any(test, feature = "privacy-analytics"))]
+pub mod privacy_preserving_analytics;
+// Contract event data governance and catalog (issue #527)
+// A Soroban WASM exposes a single contract interface, so this standalone
+// contract is opt-in: enabled for host tests and for feature-gated builds.
+#[cfg(any(test, feature = "data-governance"))]
+pub mod data_governance;
+
+// Multi-tenant support with namespace isolation (issue #394)
+// A Soroban WASM exposes a single contract interface, so this standalone
+// contract is opt-in: enabled for host tests and for feature-gated builds.
+#[cfg(any(test, feature = "multi-tenant"))]
+pub mod multi_tenant;
+
+#[cfg(test)]
+mod multi_tenant_tests;
+
+// Contract event sourcing with CQRS pattern (issue #412)
+pub mod cqrs;
+
+#[cfg(test)]
+mod cqrs_tests;
+
+#[cfg(test)]
+mod pause_granular_tests;
+
+// Confidential event metadata and access control policies (issue #401)
+pub mod confidential_metadata;
+
+#[cfg(test)]
+mod confidential_metadata_tests;
+
+// Event aggregation pipelines and materialized views (issue #396)
+pub mod event_aggregation;
+
+#[cfg(test)]
+mod event_aggregation_tests;
+
+pub use cqrs::*;
+
 
 /// Zero/invalid Stellar address (all zeroes) used to reject `NewOwnerIsZero`.
 const NULL_ACCOUNT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -53,6 +151,46 @@ const MAX_CATEGORY_LEN: u32 = 18;
 
 /// Maximum acceptable drift for ledger timestamps when logging new events.
 const MAX_TIMESTAMP_DRIFT_SECONDS: u64 = 3600;
+
+/// Supported schema definition formats for event metadata.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchemaFormat {
+    JsonSchemaDraft7,
+    JsonSchema201909,
+    Protobuf,
+}
+
+/// Compatibility classification for schema evolution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchemaCompatibility {
+    Full,
+    Backward,
+    Forward,
+    Breaking,
+    Unknown,
+}
+
+/// Versioned metadata schema descriptor for an event type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Schema {
+    pub format: SchemaFormat,
+    pub version: u32,
+    pub definition: Bytes,
+    pub compatibility: SchemaCompatibility,
+}
+
+/// Migration function used to transform metadata between schema versions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationFunction {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub name: Symbol,
+    pub body: Bytes,
+}
 
 /// An audit event stored on-chain.
 ///
@@ -132,6 +270,49 @@ pub struct RuntimeState {
     pub global_metadata_max_size: u32,
 }
 
+/// Granular pause configuration per operation type (issue #415).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseConfig {
+    pub log_events: bool,
+    pub governance: bool,
+    pub queries: bool,
+}
+
+impl PauseConfig {
+    pub fn default() -> Self {
+        Self {
+            log_events: false,
+            governance: false,
+            queries: false,
+        }
+    }
+
+    pub fn all_paused() -> Self {
+        Self {
+            log_events: true,
+            governance: true,
+            queries: true,
+        }
+    }
+
+    pub fn is_any_paused(&self) -> bool {
+        self.log_events || self.governance || self.queries
+    }
+}
+
+/// Contract health status and granular pause indicators (issue #415).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthStatus {
+    pub is_healthy: bool,
+    pub is_paused: bool,
+    pub pause_config: PauseConfig,
+    pub paused_since: u64,
+    pub expires_at: u64,
+    pub total_events: u32,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -166,12 +347,28 @@ pub enum DataKey {
     EventData(BytesN<32>),
     /// Sequential index → event ID, for ordered retrieval.
     EventOrder(u32),
+    /// Ledger when an event index was first added to the audit log.
+    EventLedger(u32),
+    /// Global event index for every content-addressed event ID version.
+    HistoricalEventIndex(BytesN<32>),
+    /// Event state snapshots ordered by ledger for historical queries.
+    HistoricalEventSnapshots(u32),
+    /// Ledger-indexed global event counts.
+    HistoricalTotals,
+    /// Ledger and global-order index pairs, ordered by ledger, for each event type.
+    HistoricalTypeIndices(Symbol),
     /// Per-event-type metadata size cap (issue #67). Absent = use global default.
     EventMetadataMaxSize(Symbol),
     /// Global metadata size cap (issue #67). Absent = DEFAULT_MAX_METADATA_SIZE.
     GlobalMetadataMaxSize,
     /// Per-event-type metadata validation schema (issue #202). Absent = no schema constraint.
     MetadataSchema(Symbol),
+    /// Versioned schema registry entry for a specific event type and schema version.
+    EventSchema(Symbol, u32),
+    /// Registered schema versions keyed by event type.
+    SchemaVersions(Symbol),
+    /// Migration function for metadata updates between schema versions.
+    EventSchemaMigration(Symbol, u32, u32),
     /// Cached full runtime state for fast reads.
     RuntimeState,
     /// Signature stored for an event (issue #69): (pubkey, signature).
@@ -230,6 +427,14 @@ pub enum DataKey {
     LogEventReentrancyGuard,
     /// Timestamp when the contract was paused (issue #78).
     PausedSince,
+    /// Granular pause configuration (issue #415).
+    PauseConfig,
+    /// Reason string for pause (issue #415).
+    PauseReason,
+    /// Arbitrary metadata for pause (issue #415).
+    PauseMetadata,
+    /// Expiration timestamp for auto-unpause (issue #415).
+    PauseExpiration,
     /// Webhook registrations (#25): per-event-type list of (url, secret) pairs. Owner-only.
     WebhookRegistrations(Symbol),
     /// Snapshot count — total snapshots created (issue #213).
@@ -332,6 +537,112 @@ pub enum DataKey {
     /// secret-rotation) audit records via `log_operational_action`, in addition to the
     /// contract owner(s).
     OpsAuditRecorders,
+
+    // ── RBAC (issue #365) ───────────────────────────────────────────────────
+
+    /// Whether role-based access control is active. When false (default), all legacy
+    /// owner/multisig and open-submitter behaviour is preserved for compatibility.
+    RbacEnabled,
+    /// Role assigned to an address: `DataKey::Role(Address) -> Role`.
+    Role(Address),
+
+    // ── Configurable dedup policies (issue #366) ─────────────────────────────
+
+    /// Global dedup policy (default `DedupPolicy::ContentHash`).
+    DedupPolicyConfig,
+    /// Per-event-type dedup policy override.
+    DedupPolicyConfigForType(Symbol),
+    /// Timestamp-scoped dedup map: content hash → (event index, ledger timestamp).
+    EventContentHashWithTs(BytesN<32>),
+    /// Custom-policy dedup map: user-supplied key → event index.
+    EventCustomKey(BytesN<32>),
+    /// Transient handshake key for the active `log_event_with_custom_key` call.
+    PendingCustomDedupKey,
+
+    // ── Archiving with compression & off-chain storage (issue #367) ──────────
+
+    /// Current archiving configuration.
+    ArchiveConfig,
+    /// Counter of archived events stored with on-chain compression.
+    ArchivedCompressedCount,
+    /// Counter of archived events stored as off-chain references.
+    ArchivedOffchainCount,
+    /// Off-chain archive pointer stored in place of (or alongside) full event data.
+    ArchivedEventRefKey(BytesN<32>),
+
+    // ── Event versioning (issue #368) ────────────────────────────────────────
+
+    /// Optional tag attached to a specific historical version of an event.
+    EventVersionTag(u32, u32),
+
+    // Notification preferences & digests (issue #409)
+
+    /// Notification preference keyed by sha256(subscriber || event_type).
+    NotifPreference(BytesN<32>),
+    /// Auto-incrementing digest batch counter.
+    NotifBatchCount,
+    /// Individual digest batch record.
+    NotifBatch(u32),
+    /// Consecutive-failure counter per batch ID (for auto-disable after 5 fails).
+    NotifConsecutiveFails(u32),
+    /// Aggregate notification delivery statistics.
+    NotifStats,
+
+    // Cross-contract event composition & workflows (issue #410)
+
+    /// Total number of cross-contract compositions created.
+    CrossContractCount,
+    /// Individual cross-contract composition record.
+    CrossContractEvent(u32),
+    /// Total number of external event anchors registered.
+    ExternalEventCount,
+    /// Individual external event anchor record.
+    ExternalEventData(u32),
+    /// Total number of workflow definitions.
+    WorkflowCount,
+    /// Individual workflow definition.
+    WorkflowDef(u32),
+    /// Total number of workflow execution instances.
+    WorkflowExecCount,
+    /// Individual workflow execution instance.
+    WorkflowExec(u32),
+
+    // Event marketplace (issue #411)
+
+    /// Total number of marketplace listings.
+    ListingCount,
+    /// Individual marketplace listing.
+    ListingData(u32),
+    /// Total number of purchases.
+    PurchaseCount,
+    /// Individual purchase record.
+    PurchaseData(u32),
+    /// Total number of subscriptions.
+    SubCount,
+    /// Individual subscription record.
+    SubData(u32),
+    /// Buyer access record keyed by (listing_id, buyer).
+    BuyerAccessData(u32, Address),
+    /// Platform fee in basis points.
+    MarketplaceFee,
+    /// Per-seller statistics.
+    SellerStats(Address),
+    /// Total number of disputes.
+    DisputeCount,
+    /// Individual dispute record.
+    DisputeData(u32),
+
+    // Cross-contract automated TTL & rent optimization (issue #866)
+
+    /// Automated TTL bump policy for cross-contract state keys
+    /// (instance tier: tiny config blob, read on every interaction).
+    XctTtlPolicy,
+    /// Monotonic count + ledger of the last automated TTL bump performed on
+    /// cross-contract keys (instance tier).
+    XctBumpStats,
+    /// Tamper-evident SHA-256 digest for each cross-contract composition.
+    /// Persistent tier so integrity evidence outlives the hot path.
+    XctCompositionHash(u32),
 }
 
 #[contracterror]
@@ -641,6 +952,61 @@ pub enum ContractError {
     /// `add_ops_recorder`.
     /// **Resolution**: Have the owner call `add_ops_recorder` for this address first.
     UnauthorizedOpsRecorder = 73,
+
+    /// **Code 74**: Caller's role is insufficient for the operation (RBAC, issue #365).
+    /// **Common cause**: Calling an operation whose `require_role_min` threshold exceeds
+    /// the caller's assigned `Role`, when RBAC is enabled.
+    /// **Resolution**: Have an Admin assign a sufficient role via `set_role`, or disable
+    /// RBAC (compatibility mode) via `enable_rbac(false)`.
+    RoleNotGranted = 74,
+
+    /// **Code 75**: An unknown deduplication policy discriminant was supplied (issue #366).
+    /// **Common cause**: `set_dedup_policy`/`set_dedup_policy_for_type` called with a value
+    /// outside the `DedupPolicy` enum.
+    /// **Resolution**: Use `DedupPolicy::None | ContentHash | ContentHashWithTimestamp | Custom`.
+    InvalidDedupPolicy = 75,
+
+    /// **Code 76**: The requested notification batch does not exist.
+    NotifBatchNotFound = 76,
+
+    /// **Code 77**: The referenced workflow execution is not in the `InProgress` state.
+    /// **Common cause**: `record_workflow_step` called on a completed or cancelled execution.
+    WorkflowNotInProgress = 77,
+
+    /// **Code 78**: The referenced workflow definition is not active (archived).
+    /// **Common cause**: `start_workflow` called with an archived definition ID.
+    WorkflowNotActive = 78,
+
+    /// **Code 79**: The requested marketplace listing does not exist or is inactive.
+    ListingNotFound = 79,
+
+    /// **Code 80**: The listing requires a subscription, not a one-time purchase.
+    /// **Common cause**: `purchase_listing` called on a `Subscription`-type listing.
+    ListingRequiresSubscription = 80,
+
+    /// **Code 81**: The listing requires a one-time purchase, not a subscription.
+    /// **Common cause**: `subscribe` called on a non-subscription listing.
+    ListingRequiresPurchase = 81,
+
+    /// **Code 82**: Platform fee basis points must be 0–10000.
+    InvalidMarketplaceFee = 82,
+
+    /// **Code 83**: The buyer does not have valid access to this listing.
+    NoListingAccess = 83,
+
+    /// **Code 84**: The dispute does not exist.
+    DisputeNotFound = 84,
+
+    /// **Code 85**: Workflow step index exceeds the definition's step count.
+    /// **Common cause**: `record_workflow_step` called with an out-of-range index.
+    /// **Resolution**: Use a `step_index` in `0..wf.steps.len()`.
+    WorkflowStepOutOfRange = 85,
+
+    /// **Code 86**: The cross-contract TTL policy parameters are invalid.
+    /// **Common cause**: `set_xct_ttl_policy` with a zero bump threshold or a
+    /// bump target smaller than the threshold.
+    /// **Resolution**: `bump_target >= bump_threshold > 0`.
+    InvalidTtlPolicy = 86,
 }
 
 #[contracttype]
@@ -650,6 +1016,14 @@ pub struct EventVersion {
     pub data: Event,
     pub updated_at: u64,
     pub updated_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalEventSnapshot {
+    pub ledger: u32,
+    pub event_id: BytesN<32>,
+    pub event: Event,
 }
 
 /// On-chain webhook registration entry (#25).
@@ -685,6 +1059,8 @@ pub struct ContractStatistics {
     pub events_last_day: u32,
     pub events_last_week: u32,
     pub top_submitters: Vec<(Address, u32)>,
+    pub is_paused: bool,
+    pub pause_config: PauseConfig,
 }
 
 /// Result of a single event in a batch submission (issue #223).
@@ -743,6 +1119,10 @@ pub enum ProposalAction {
     RollbackEvent(u32, u32),
     Pause,
     Unpause,
+    SetRole(Address, Option<Role>),
+    SetSubmitterRateLimit(Address, u32),
+    SetEventTtl(u32),
+    SetGlobalMetadataMaxSize(u32),
 }
 
 #[contracttype]
@@ -778,6 +1158,153 @@ pub struct TtlCleanupStats {
     pub cleaned: u32,
     /// Ledger sequence number of the last cleanup run, 0 if none.
     pub last_run_ledger: u32,
+}
+
+// ── RBAC types (issue #365) ──────────────────────────────────────────────────
+
+/// Roles for the role-based access control system.
+///
+/// Precedence (high → low): `Admin` > `Auditor` > `Submitter` > `Viewer`.
+/// A caller satisfying a role also satisfies every role below it.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Role {
+    /// Full governance & configuration authority.
+    Admin = 0,
+    /// Read statistics and analyst data.
+    Auditor = 1,
+    /// Submit audit events.
+    Submitter = 2,
+    /// Read-only access.
+    Viewer = 3,
+}
+
+impl Role {
+    /// Rank used for precedence checks. Higher rank = higher privilege.
+    pub fn rank(&self) -> u32 {
+        match self {
+            Role::Admin => 4,
+            Role::Auditor => 3,
+            Role::Submitter => 2,
+            Role::Viewer => 1,
+        }
+    }
+}
+
+/// When RBAC is disabled (`RbacEnabled` false), role checks are not enforced so that
+/// legacy owner/multisig and open-submitter behaviour is fully preserved. Once enabled,
+/// writes require at least `Submitter`, governance requires `Admin`, reads require at
+/// least `Viewer`, and `get_statistics` requires at least `Auditor`.
+
+// ── Deduplication policy types (issue #366) ──────────────────────────────────
+
+/// Configurable event deduplication policy.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DedupPolicy {
+    /// Never deduplicate; every call stores a new event.
+    None = 0,
+    /// Deduplicate on `hash(event_type || submitter || metadata)` (legacy behaviour).
+    ContentHash = 1,
+    /// Deduplicate on the content hash but only within the same ledger timestamp.
+    ContentHashWithTimestamp = 2,
+    /// Deduplicate on a caller-supplied key (off-chain logic decides what is a duplicate).
+    Custom = 3,
+}
+
+// ── Archiving types (issue #367) ─────────────────────────────────────────────
+
+/// Compression mode for archived event metadata.
+///
+/// `0` = no compression, `1` = run-length encoding. Real-world gzip/zstd cannot be
+/// executed on-chain in a `no_std` Soroban contract, so run-length encoding is used
+/// on-chain; richer compression can be applied off-chain before upload.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveConfig {
+    /// Off-chain storage enabled: archived events are stored as references
+    /// (URI + checksum) instead of full payloads to minimise on-chain footprint.
+    pub offchain_storage: bool,
+    /// Base URL (UTF-8 bytes) under which archived event payloads are retrievable.
+    pub base_url: Bytes,
+    /// Compression mode: 0 = none, 1 = run-length encoding.
+    pub compression: u32,
+}
+
+impl ArchiveConfig {
+    /// Default: in-chain storage, no compression, empty base URL.
+    pub fn default_config(env: &Env) -> Self {
+        ArchiveConfig {
+            offchain_storage: false,
+            base_url: Bytes::new(env),
+            compression: 0,
+        }
+    }
+}
+
+/// Pointer to an event archived off-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivedEventRef {
+    /// Content-addressed event ID.
+    pub id: BytesN<32>,
+    /// Sequential index of the archived event.
+    pub index: u32,
+    /// SHA-256 of the event's serialised payload (for off-chain verification).
+    pub checksum: BytesN<32>,
+    /// Fully-qualified retrieval URL (`base_url || <event_id-hex>`).
+    pub url: Bytes,
+    /// Ledger timestamp at which the event was archived.
+    pub archived_at: u64,
+}
+
+/// Aggregate archive statistics.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveStats {
+    /// Total archived events.
+    pub total_archived: u32,
+    /// Archived events stored with on-chain compressed metadata.
+    pub total_compressed: u32,
+    /// Archived events stored as off-chain references.
+    pub total_offchain: u32,
+}
+
+// ── Versioning types (issue #368) ────────────────────────────────────────────
+
+/// A single semantic field change between two versions of an event.
+///
+/// `from`/`to` encode field values canonically: numbers via little-endian bytes,
+/// `Symbol` via UTF-8 name bytes, `Bytes` raw, and `Address` via its strkey bytes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FieldChange {
+    /// Name of the changed field (`metadata`, `event_type`, `submitter`, ...).
+    pub field: Symbol,
+    /// Canonical bytes of the previous value (empty marker = absent/`None`).
+    pub from: Bytes,
+    /// Canonical bytes of the new value.
+    pub to: Bytes,
+}
+
+/// Detailed structural comparison of two versions of an event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionComparison {
+    /// Event index being compared.
+    pub index: u32,
+    /// Origin version.
+    pub from_version: u32,
+    /// Target version.
+    pub to_version: u32,
+    /// True when the two versions are semantically identical.
+    pub same: bool,
+    /// List of field-level changes.
+    pub changes: Vec<FieldChange>,
+    /// Hash of the original event version.
+    pub from_hash: BytesN<32>,
+    /// Hash of the target event version.
+    pub to_hash: BytesN<32>,
 }
 
 // ── Additional type definitions ──────────────────────────────────────────────
@@ -1455,7 +1982,7 @@ pub struct WaterDisclosure {
     pub sites_in_stressed_areas: u32,
     // ── W7: Accounting ──
     /// Scarcity-weighted total water use across all recorded footprints, L × 10⁻⁶.
-    pub scarcity_weighted_total_L_micro: u64,
+    pub scarcity_wtd_total_L_micro: u64,
     // ── W8: Targets achieved ──
     /// Reduction achieved since base year, L × 10⁻⁶ (CDP W8.1).
     pub reduction_achieved_L_micro: u64,
@@ -1476,7 +2003,7 @@ pub struct WaterTotals {
     /// Cumulative grey water footprint, L × 10⁻⁶.
     pub total_grey_L_micro: u64,
     /// Cumulative scarcity-weighted blue water, L × 10⁻⁶.
-    pub total_scarcity_weighted_L_micro: u64,
+    pub total_scarcity_wtd_L_micro: u64,
     /// Total water risk assessments registered.
     pub total_risk_assessments: u32,
     /// Total stewardship programmes registered.
@@ -1508,7 +2035,7 @@ pub struct WaterSnapshot {
     /// Total grey water (L × 10⁻⁶).
     pub total_grey_L_micro: u64,
     /// Total scarcity-weighted blue water (L × 10⁻⁶).
-    pub total_scarcity_weighted_L_micro: u64,
+    pub total_scarcity_wtd_L_micro: u64,
     /// Total water footprint (blue + green + grey), L × 10⁻⁶.
     pub total_water_footprint_L_micro: u64,
     /// Scarcity ratio: scarcity_weighted / blue × 10 000 (bps). 0 when no blue water.
@@ -1571,6 +2098,9 @@ impl AuditLedger {
             );
         env.storage().instance().set(&DataKey::TotalEvents, &0u32);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseConfig, &PauseConfig::default());
 
         // Set version to 1 (marks contract as initialized, immutable)
         env.storage().instance().set(&DataKey::ContractVersion, &1u32);
@@ -1582,11 +2112,20 @@ impl AuditLedger {
         env.storage()
             .instance()
             .set(&DataKey::DefaultNonceMaxValue, &u32::MAX);
+
+        // Issue #365: RBAC is off by default (backward-compatible). Owner(s) are
+        // seeded as Admins so enabling RBAC never locks out existing authorities.
+        env.storage().instance().set(&DataKey::RbacEnabled, &false);
+        for i in 0..owners.len() {
+            let o = owners.get(i).unwrap();
+            env.storage().instance().set(&DataKey::Role(o), &Role::Admin);
+        }
     }
 
     /// Log a batch of events atomically and return their sequential indices.
     pub fn log_events(env: Env, events: Vec<(Address, Symbol, Bytes)>) -> Vec<u32> {
         Self::require_initialized(&env);
+        Self::require_log_events_not_paused(&env);
 
         // Single read for all global state (issue #114)
         let rs: RuntimeState = env.storage().instance().get(&DataKey::RuntimeState).unwrap_or_else(|| {
@@ -1614,10 +2153,6 @@ impl AuditLedger {
             }
         });
 
-        if rs.paused {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
-
         let global_max = rs.global_max_logs;
         let total = rs.total_events;
         let batch_len: u32 = events.len();
@@ -1642,6 +2177,9 @@ impl AuditLedger {
             }
             if !already_authorized {
                 submitter.require_auth();
+                // Issue #365: when RBAC is enabled, batch submitters must hold at
+                // least the Submitter role.
+                Self::require_role_min(&env, &submitter, Role::Submitter);
                 authorized_submitters.push_back(submitter.clone());
             }
 
@@ -1687,6 +2225,33 @@ impl AuditLedger {
             }
         }
 
+        for i in 0..submitter_batch_counts.len() {
+            let (submitter, batch_count) = submitter_batch_counts.get(i).unwrap();
+            if env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::SubmitterRateLimit(submitter.clone()))
+                .is_some()
+            {
+                let (last_ts, count): (u64, u32) = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::SubmitterRateState(submitter.clone()))
+                    .unwrap_or((0u64, 0u32));
+                let updated_count = if now == last_ts {
+                    match count.checked_add(batch_count) {
+                        Some(value) => value,
+                        None => panic_with_error!(&env, ContractError::RateLimitExceeded),
+                    }
+                } else {
+                    batch_count
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::SubmitterRateState(submitter), &(now, updated_count));
+            }
+        }
+
         let mut result_indices: Vec<u32> = Vec::new(&env);
         let mut current_total = total;
         let mut prev_hash: BytesN<32> = if current_total == 0 {
@@ -1726,6 +2291,7 @@ impl AuditLedger {
                 .instance()
                 .set(&DataKey::EventData(event_id.clone()), &evt);
             env.storage().instance().set(&DataKey::EventOrder(index), &event_id);
+            Self::record_historical_event(&env, event_id.clone(), evt.clone());
 
             let header = EventHeader {
                 index,
@@ -1813,6 +2379,8 @@ impl AuditLedger {
     ) -> BytesN<32> {
         Self::require_initialized(&env);
         submitter.require_auth();
+        // Issue #365: when RBAC is enabled, logging requires at least Submitter.
+        Self::require_role_min(&env, &submitter, Role::Submitter);
 
         // --- issue #61: reentrancy guard ---
         // Temporary storage is scoped to the current transaction; if a
@@ -1825,10 +2393,8 @@ impl AuditLedger {
         // --- issue #63: validate event_type Symbol ---
         Self::validate_event_type(&env, &event_type);
 
-        // Reject writes when contract is paused.
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        // Reject writes when contract or log_events is paused.
+        Self::require_log_events_not_paused(&env);
 
         // --- issue #141: enforce submitter blocklist/allowlist ---
         // Check if submitter is blocked
@@ -1936,21 +2502,68 @@ impl AuditLedger {
             type_count_opt = Some(count);
         }
 
-        // --- Content-addressed deduplication ---
-        // Compute hash(event_type || submitter || metadata) for dedup.
-        let content_hash = Self::compute_content_hash(&env, &event_type, &submitter, &metadata);
+        // --- Configurable content-addressed deduplication (issue #366) ---
+        // The policy is read per event type; the default (ContentHash) preserves the
+        // legacy behaviour. `force` bypasses deduplication entirely.
+        let dedup_policy = Self::effective_dedup_policy(&env, &event_type);
         if !force {
-            if let Some(existing_index) = env
-                .storage()
-                .instance()
-                .get::<_, u32>(&DataKey::EventContentHash(content_hash.clone()))
-            {
-                let existing_id: BytesN<32> = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::EventOrder(existing_index))
-                    .unwrap();
-                return existing_id;
+            match dedup_policy {
+                DedupPolicy::None => {
+                    // no deduplication: always store a new event
+                }
+                DedupPolicy::ContentHash => {
+                    let content_hash = Self::compute_content_hash(&env, &event_type, &submitter, &metadata);
+                    if let Some(existing_index) = env
+                        .storage()
+                        .instance()
+                        .get::<_, u32>(&DataKey::EventContentHash(content_hash.clone()))
+                    {
+                        let existing_id: BytesN<32> = env
+                            .storage()
+                            .instance()
+                            .get(&DataKey::EventOrder(existing_index))
+                            .unwrap();
+                        return existing_id;
+                    }
+                }
+                DedupPolicy::ContentHashWithTimestamp => {
+                    let content_hash = Self::compute_content_hash(&env, &event_type, &submitter, &metadata);
+                    let now = env.ledger().timestamp();
+                    if let Some((existing_index, existing_ts)) = env
+                        .storage()
+                        .instance()
+                        .get::<_, (u32, u64)>(&DataKey::EventContentHashWithTs(content_hash.clone()))
+                    {
+                        // Only treat as duplicate within the same ledger timestamp.
+                        if existing_ts == now {
+                            let existing_id: BytesN<32> = env
+                                .storage()
+                                .instance()
+                                .get(&DataKey::EventOrder(existing_index))
+                                .unwrap();
+                            return existing_id;
+                        }
+                    }
+                }
+                DedupPolicy::Custom => {
+                    // Custom deduplication requires an explicit key supplied through
+                    // `log_event_with_custom_key`; without one no duplicate detection
+                    // can be performed so the event is stored.
+                    if let Some(custom_key) = Self::pending_custom_key(&env) {
+                        if let Some(existing_index) = env
+                            .storage()
+                            .instance()
+                            .get::<_, u32>(&DataKey::EventCustomKey(custom_key))
+                        {
+                            let existing_id: BytesN<32> = env
+                                .storage()
+                                .instance()
+                                .get(&DataKey::EventOrder(existing_index))
+                                .unwrap();
+                            return existing_id;
+                        }
+                    }
+                }
             }
         }
 
@@ -1999,6 +2612,7 @@ impl AuditLedger {
             .instance()
             .set(&DataKey::EventData(event_id.clone()), &evt);
         env.storage().instance().set(&DataKey::EventOrder(index), &event_id);
+        Self::record_historical_event(&env, event_id.clone(), evt.clone());
 
         // --- issue #56: store lightweight header separately ---
         let header = EventHeader {
@@ -2024,6 +2638,32 @@ impl AuditLedger {
                 .persistent()
                 .extend_ttl(&DataKey::EventData(event_id.clone()), ttl, ttl);
         }
+
+        // --- issue #366: persist dedup index maps for the effective policy ---
+        match dedup_policy {
+            DedupPolicy::ContentHash => {
+                let content_hash = Self::compute_content_hash(&env, &event_type, &submitter, &metadata);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::EventContentHash(content_hash), &index);
+            }
+            DedupPolicy::ContentHashWithTimestamp => {
+                let content_hash = Self::compute_content_hash(&env, &event_type, &submitter, &metadata);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::EventContentHashWithTs(content_hash), &(index, timestamp));
+            }
+            DedupPolicy::Custom => {
+                if let Some(custom_key) = Self::pending_custom_key(&env) {
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::EventCustomKey(custom_key), &index);
+                }
+            }
+            DedupPolicy::None => {}
+        }
+        // Clear any custom-key handshake state for this call.
+        env.storage().temporary().remove(&DataKey::PendingCustomDedupKey);
 
         // Task 4: cache low_cost_mode to avoid double read.
         let low_cost = Self::effective_low_cost_mode(&env);
@@ -2136,6 +2776,8 @@ impl AuditLedger {
 
     /// Return the last accepted nonce for `submitter`. Returns 0 if no nonce has been used yet.
     pub fn get_submitter_nonce(env: Env, submitter: Address) -> u32 {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage()
             .instance()
             .get::<_, NonceState>(&DataKey::SubmitterNonce(submitter))
@@ -2145,6 +2787,8 @@ impl AuditLedger {
 
     /// Return the full nonce state for a submitter (issue #214).
     pub fn get_submitter_nonce_state(env: Env, submitter: Address) -> NonceState {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage()
             .instance()
             .get::<_, NonceState>(&DataKey::SubmitterNonce(submitter))
@@ -2167,6 +2811,7 @@ impl AuditLedger {
     ) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         if max_nonce == 0 {
             panic_with_error!(&env, ContractError::NonceExhausted);
@@ -2198,6 +2843,7 @@ impl AuditLedger {
     pub fn reset_submitter_nonce(env: Env, caller: Address, submitter: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         let state: NonceState = env
             .storage()
@@ -2232,6 +2878,7 @@ impl AuditLedger {
     ) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         if max_nonce == 0 {
             panic_with_error!(&env, ContractError::NonceExhausted);
@@ -2250,30 +2897,80 @@ impl AuditLedger {
 
     /// Return the default nonce window size.
     pub fn get_default_nonce_window_size(env: Env) -> u32 {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         Self::default_nonce_window_size(&env)
     }
 
     /// Return the default nonce max value.
     pub fn get_default_nonce_max_value(env: Env) -> u32 {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         Self::default_nonce_max_value(&env)
     }
 
     pub fn total_events(env: Env) -> u32 {
         Self::require_initialized(&env);
-        // Prefer RuntimeState for a single read; fallback to Config for legacy contracts.
-        if let Some(rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
-            return rs.total_events;
-        }
-        env.storage()
+        Self::require_queries_not_paused(&env);
+        Self::total_events_internal(&env)
+    }
+
+    /// Return the event count as of the end of `ledger`.
+    pub fn get_total_events_at_ledger(env: Env, ledger: u32) -> u32 {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let snapshots: Vec<(u32, u32)> = env
+            .storage()
             .instance()
-            .get::<_, Config>(&DataKey::Config)
-            .map(|c| c.total_events)
-            .unwrap_or(0)
+            .get(&DataKey::HistoricalTotals)
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::historical_count_at_ledger(&snapshots, ledger)
+    }
+
+    /// Retrieve an event as it existed at the end of `ledger`.
+    pub fn get_event_at_ledger(env: Env, event_id: BytesN<32>, ledger: u32) -> Event {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let index: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::HistoricalEventIndex(event_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EventDoesNotExist));
+        let count = Self::get_total_events_at_ledger(env.clone(), ledger);
+        if index >= count {
+            panic_with_error!(&env, ContractError::EventDoesNotExist);
+        }
+        let snapshot = Self::historical_snapshot_by_index(&env, index, ledger);
+        if snapshot.event_id == event_id {
+            return snapshot.event;
+        }
+        panic_with_error!(&env, ContractError::EventDoesNotExist);
+    }
+
+    /// Retrieve an event by its type-relative index as of the end of `ledger`.
+    pub fn get_event_by_type_at_ledger(env: Env, event_type: Symbol, type_index: u32, ledger: u32) -> Event {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let snapshots: Vec<(u32, u32)> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HistoricalTypeIndices(event_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if type_index >= snapshots.len() {
+            panic_with_error!(&env, ContractError::EventTypeIndexOutOfBounds);
+        }
+        let (snapshot_ledger, global_index) = snapshots.get(type_index).unwrap();
+        if snapshot_ledger > ledger {
+            panic_with_error!(&env, ContractError::EventTypeIndexOutOfBounds);
+        }
+        Self::historical_snapshot_by_index(&env, global_index, ledger).event
     }
 
     /// Return the cached count of events for a given `event_type`.
     /// This provides a lightweight aggregation query (issue #205).
     pub fn get_event_type_count(env: Env, event_type: Symbol) -> u32 {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage()
             .instance()
             .get::<_, u32>(&DataKey::EventTypeCount(event_type))
@@ -2284,6 +2981,7 @@ impl AuditLedger {
     /// When TTL is configured, the persistent entry's TTL is extended on each read (issue #200).
     pub fn get_event(env: Env, id: BytesN<32>) -> Event {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let evt: Event = env.storage()
             .instance()
             .get(&DataKey::EventData(id.clone()))
@@ -2311,6 +3009,7 @@ impl AuditLedger {
     /// Retrieve only the event metadata (optimized for low-fee environments, issue #57).
     pub fn get_event_metadata(env: Env, id: BytesN<32>) -> Bytes {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let evt: Event = env
             .storage()
             .instance()
@@ -2324,6 +3023,7 @@ impl AuditLedger {
     /// Retrieve only the event header (index, timestamp, event_type, submitter) — no metadata (issue #56).
     pub fn get_event_header(env: Env, id: BytesN<32>) -> EventHeader {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let evt: Event = env
             .storage()
             .instance()
@@ -2342,6 +3042,7 @@ impl AuditLedger {
     /// Retrieve an event by its sequential insertion order (0-based).
     pub fn get_event_by_order(env: Env, order: u32) -> Event {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let id: BytesN<32> = env
             .storage()
             .instance()
@@ -2359,6 +3060,7 @@ impl AuditLedger {
 
     pub fn event_count(env: Env, event_type: Symbol) -> u32 {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if Self::effective_low_cost_mode(&env) {
             panic_with_error!(&env, ContractError::CapNotSet);
         }
@@ -2367,7 +3069,9 @@ impl AuditLedger {
 
     /// Count events matching a category (scans all events; pagination available via list_events_by_category)
     pub fn event_count_by_category(env: Env, category: Symbol) -> u32 {
-        let total = Self::total_events(env.clone());
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let total = Self::total_events_internal(&env);
         let mut cnt: u32 = 0;
         for i in 0..total {
             let id: BytesN<32> = env.storage().instance().get(&DataKey::EventOrder(i)).unwrap();
@@ -2381,7 +3085,9 @@ impl AuditLedger {
 
     /// List event headers for a given category with simple pagination.
     pub fn list_events_by_category(env: Env, category: Symbol, start: u32, limit: u32) -> Vec<EventHeader> {
-        let total = Self::total_events(env.clone());
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let total = Self::total_events_internal(&env);
         let mut out: Vec<EventHeader> = Vec::new(&env);
         if start >= total {
             return out;
@@ -2408,14 +3114,38 @@ impl AuditLedger {
 
     /// Archive events older than `cutoff_timestamp` into cold storage.
     /// Owner-only. Returns number archived.
+    ///
+    /// Honours the configured `ArchiveConfig` (issue #367):
+    /// - `compression == 1`: archived metadata is stored run-length encoded.
+    /// - `offchain_storage == true`: the full event payload is not kept on-chain;
+    ///   instead an `ArchivedEventRef` (URI + checksum) is stored under
+    ///   `ArchivedEventRefKey`, so the payload can be fetched off-chain and verified
+    ///   via `verify_archived_event_checksum`.
     pub fn archive_events(env: Env, caller: Address, cutoff_timestamp: u64) -> u32 {
+        Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_log_events_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
+        let config: ArchiveConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchiveConfig)
+            .unwrap_or_else(|| ArchiveConfig::default_config(&env));
         let mut archived: u32 = env
             .storage()
             .instance()
             .get(&DataKey::ArchivedTotalEvents)
+            .unwrap_or(0u32);
+        let mut compressed_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchivedCompressedCount)
+            .unwrap_or(0u32);
+        let mut offchain_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchivedOffchainCount)
             .unwrap_or(0u32);
         let mut moved: u32 = 0;
         // Resume scanning from the last position to avoid re-scanning entire history on each call.
@@ -2437,10 +3167,7 @@ impl AuditLedger {
             if evt.timestamp >= cutoff_timestamp {
                 break;
             }
-            // copy into archived storage
-            env.storage()
-                .instance()
-                .set(&DataKey::ArchivedEventData(id.clone()), &evt);
+
             if let Some(header) = env
                 .storage()
                 .instance()
@@ -2450,15 +3177,59 @@ impl AuditLedger {
                     .instance()
                     .set(&DataKey::ArchivedEventHeaderKey(id.clone()), &header);
             }
-            if let Some(meta) = env
+            let meta: Bytes = env
                 .storage()
                 .instance()
-                .get::<_, Bytes>(&DataKey::EventMetadata(id.clone()))
-            {
+                .get(&DataKey::EventMetadata(id.clone()))
+                .unwrap_or(Bytes::new(&env));
+
+            // Off-chain storage: keep only header + compressed metadata + ref.
+            if config.offchain_storage {
+                let stored_meta = if config.compression == 1 {
+                    Self::compress_bytes(&env, &meta)
+                } else {
+                    Self::tag_raw_bytes(&env, &meta)
+                };
                 env.storage()
                     .instance()
-                    .set(&DataKey::ArchivedEventMetadata(id.clone()), &meta);
+                    .set(&DataKey::ArchivedEventMetadata(id.clone()), &stored_meta);
+                env.storage().instance().set(
+                    &DataKey::ArchivedEventRefKey(id.clone()),
+                    &ArchivedEventRef {
+                        id: id.clone(),
+                        index: i,
+                        checksum: evt.event_hash.clone(),
+                        url: Self::build_archive_url(&env, &config, &id),
+                        archived_at: env.ledger().timestamp(),
+                    },
+                );
+                if config.compression == 1 {
+                    compressed_count += 1;
+                }
+                offchain_count += 1;
+            } else {
+                // On-chain storage: keep the full event (metadata potentially compressed).
+                if config.compression == 1 {
+                    let stored_meta = Self::compress_bytes(&env, &meta);
+                    let mut stored_evt = evt.clone();
+                    stored_evt.metadata = stored_meta.clone();
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ArchivedEventData(id.clone()), &stored_evt);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ArchivedEventMetadata(id.clone()), &stored_meta);
+                    compressed_count += 1;
+                } else {
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ArchivedEventData(id.clone()), &evt);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ArchivedEventMetadata(id.clone()), &meta);
+                }
             }
+
             env.storage()
                 .instance()
                 .set(&DataKey::EventArchivedFlag(id.clone()), &true);
@@ -2472,19 +3243,116 @@ impl AuditLedger {
         // persist scan cursor so subsequent calls resume where we left off
         env.storage().instance().set(&DataKey::ArchiveScanCursor, &i);
         env.storage().instance().set(&DataKey::ArchivedTotalEvents, &archived);
+        if moved > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::ArchivedCompressedCount, &compressed_count);
+            env.storage()
+                .instance()
+                .set(&DataKey::ArchivedOffchainCount, &offchain_count);
+        }
         env.events().publish((Symbol::new(&env, "events_archived"),), (moved,));
         moved
     }
 
+    /// Return a fully reconstructed archived event. Prefers the on-chain copy; when
+    /// the event was archived off-chain it is rebuilt from the stored header, tagged
+    /// metadata and event hash (issue #367).
     pub fn get_archived_event(env: Env, id: BytesN<32>) -> Event {
-        env.storage()
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        if let Some(evt) = env
+            .storage()
             .instance()
-            .get(&DataKey::ArchivedEventData(id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EventDoesNotExist))
+            .get::<_, Event>(&DataKey::ArchivedEventData(id.clone()))
+        {
+            let mut evt = evt;
+            if Self::is_compressed_tag(&env, &evt.metadata) {
+                evt.metadata = Self::expand_archived_metadata(&env, &evt.metadata);
+            }
+            return evt;
+        }
+        let proof: ArchivedEventRef = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchivedEventRefKey(id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EventDoesNotExist));
+        let header: EventHeader = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArchivedEventHeaderKey(id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EventDoesNotExist));
+        let metadata = Self::expand_archived_metadata(
+            &env,
+            &env.storage()
+                .instance()
+                .get(&DataKey::ArchivedEventMetadata(id.clone()))
+                .unwrap_or(Bytes::new(&env)),
+        );
+        Event {
+            index: header.index,
+            timestamp: header.timestamp,
+            event_type: header.event_type,
+            category: Symbol::new(&env, "general"),
+            submitter: header.submitter,
+            metadata,
+            sub_event_type: None,
+            version: Self::current_contract_version(&env),
+            event_hash: proof.checksum,
+            prev_hash: BytesN::from_array(&env, &[0u8; 32]),
+            parent_event_id: None,
+        }
+    }
+
+    /// Return the off-chain archive reference for an archived event (issue #367).
+    pub fn get_archived_event_ref(env: Env, id: BytesN<32>) -> Option<ArchivedEventRef> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        env.storage().instance().get(&DataKey::ArchivedEventRefKey(id))
+    }
+
+    /// Verify that a caller-reconstructed off-chain payload matches the on-chain
+    /// checksum recorded at archive time (issue #367).
+    pub fn verify_archived_event_checksum(env: Env, id: BytesN<32>, candidate: Event) -> bool {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let Some(proof) = env
+            .storage()
+            .instance()
+            .get::<_, ArchivedEventRef>(&DataKey::ArchivedEventRefKey(id.clone()))
+        else {
+            return false;
+        };
+        candidate.event_hash == proof.checksum
+    }
+
+    /// Aggregate archiving statistics (issue #367).
+    pub fn get_archive_stats(env: Env) -> ArchiveStats {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        ArchiveStats {
+            total_archived: env
+                .storage()
+                .instance()
+                .get(&DataKey::ArchivedTotalEvents)
+                .unwrap_or(0u32),
+            total_compressed: env
+                .storage()
+                .instance()
+                .get(&DataKey::ArchivedCompressedCount)
+                .unwrap_or(0u32),
+            total_offchain: env
+                .storage()
+                .instance()
+                .get(&DataKey::ArchivedOffchainCount)
+                .unwrap_or(0u32),
+        }
     }
 
     pub fn get_archived_event_count(env: Env) -> u32 {
-        // count actual archived entries (tolerate gaps)
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        // count actual archived entries (tolerate gaps); off-chain refs count too.
         let total: u32 = env
             .storage()
             .instance()
@@ -2497,7 +3365,9 @@ impl AuditLedger {
                 .instance()
                 .get::<_, BytesN<32>>(&DataKey::ArchivedEventOrder(i))
             {
-                if env.storage().instance().has(&DataKey::ArchivedEventData(id)) {
+                if env.storage().instance().has(&DataKey::ArchivedEventData(id.clone()))
+                    || env.storage().instance().has(&DataKey::ArchivedEventRefKey(id))
+                {
                     cnt += 1;
                 }
             }
@@ -2506,6 +3376,8 @@ impl AuditLedger {
     }
 
     pub fn list_archived_events(env: Env, start: u32, limit: u32) -> Vec<EventHeader> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let total: u32 = env
             .storage()
             .instance()
@@ -2539,7 +3411,9 @@ impl AuditLedger {
 
     /// Permanently purge archived events older than cutoff. `confirm` must be true.
     pub fn purge_archived_events(env: Env, caller: Address, cutoff_timestamp: u64, confirm: bool) -> u32 {
+        Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_log_events_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         if !confirm {
             return 0u32;
@@ -2585,6 +3459,7 @@ impl AuditLedger {
     pub fn upgrade_contract(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         if new_wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
             panic_with_error!(&env, ContractError::InvalidWasmHash);
@@ -2604,6 +3479,7 @@ impl AuditLedger {
 
     pub fn get_event_by_type(env: Env, event_type: Symbol, type_index: u32) -> Event {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if Self::effective_low_cost_mode(&env) {
             panic_with_error!(&env, ContractError::EventTypeIndexOutOfBounds);
         }
@@ -2634,6 +3510,8 @@ impl AuditLedger {
     }
 
     pub fn list_events(env: Env, offset: u32, limit: u32) -> Vec<Event> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if limit == 0 {
             return Vec::new(&env);
         }
@@ -2641,7 +3519,7 @@ impl AuditLedger {
             panic_with_error!(&env, ContractError::InvalidPaginationParams);
         }
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         if offset >= total {
             return Vec::new(&env);
         }
@@ -2655,6 +3533,8 @@ impl AuditLedger {
     }
 
     pub fn list_events_by_type(env: Env, event_type: Symbol, offset: u32, limit: u32) -> Vec<Event> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if limit == 0 {
             return Vec::new(&env);
         }
@@ -2691,6 +3571,7 @@ impl AuditLedger {
         limit: u32,
     ) -> Vec<Event> {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
 
         if limit == 0 {
             return Vec::new(&env);
@@ -2717,6 +3598,7 @@ impl AuditLedger {
     /// Return the number of events submitted by a given address (issue #206).
     pub fn submitter_event_count(env: Env, submitter: Address) -> u32 {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         Self::submitter_count(&env, submitter)
     }
 
@@ -2728,6 +3610,7 @@ impl AuditLedger {
         submitter_index: u32,
     ) -> Event {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
 
         let count = Self::submitter_count(&env, submitter.clone());
         if count == 0 {
@@ -2769,6 +3652,7 @@ impl AuditLedger {
         limit: u32,
     ) -> Vec<Event> {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
 
         if limit == 0 {
             return Vec::new(&env);
@@ -2797,6 +3681,8 @@ impl AuditLedger {
         offset: u32,
         limit: u32,
     ) -> Vec<Event> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if limit == 0 {
             return Vec::new(&env);
         }
@@ -2807,7 +3693,7 @@ impl AuditLedger {
             return Vec::new(&env);
         }
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         let mut matches = Vec::new(&env);
         for i in 0..total {
             let evt = Self::get_event_by_order(env.clone(), i);
@@ -2830,6 +3716,8 @@ impl AuditLedger {
     }
 
     pub fn search_events(env: Env, query: Bytes, offset: u32, limit: u32) -> Vec<Event> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if limit == 0 {
             return Vec::new(&env);
         }
@@ -2837,7 +3725,7 @@ impl AuditLedger {
             panic_with_error!(&env, ContractError::InvalidPaginationParams);
         }
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         let mut matches = Vec::new(&env);
         for i in 0..total {
             let evt = Self::get_event_by_order(env.clone(), i);
@@ -2860,10 +3748,12 @@ impl AuditLedger {
     }
 
     pub fn update_event(env: Env, caller: Address, index: u32, new_metadata: Bytes) -> BytesN<32> {
+        Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_log_events_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         if index >= total {
             panic_with_error!(&env, ContractError::EventDoesNotExist);
         }
@@ -2949,6 +3839,7 @@ impl AuditLedger {
             .instance()
             .set(&DataKey::EventData(new_id.clone()), &updated_event);
         env.storage().instance().set(&DataKey::EventOrder(index), &new_id);
+        Self::record_historical_event(&env, new_id.clone(), updated_event.clone());
         env.storage().instance().set(
             &DataKey::EventHeaderKey(new_id.clone()),
             &EventHeader {
@@ -2982,6 +3873,7 @@ impl AuditLedger {
             env.storage()
                 .instance()
                 .set(&DataKey::EventMeta(event_id.clone()), &later_event);
+            Self::record_historical_event(&env, event_id.clone(), later_event.clone());
             next_prev_hash = later_event.event_hash.clone();
         }
 
@@ -3001,6 +3893,7 @@ impl AuditLedger {
                     env.storage()
                         .instance()
                         .set(&DataKey::EventMeta(event_id.clone()), &later_event);
+                    Self::record_historical_event(&env, event_id.clone(), later_event.clone());
                 }
             }
         }
@@ -3013,10 +3906,10 @@ impl AuditLedger {
         new_id
     }
 
-    pub fn get_event_history(env: Env, index: u32) -> Vec<EventVersion> {
-        let total = Self::total_events(env.clone());
+    pub fn get_event_history_internal(env: &Env, index: u32) -> Vec<EventVersion> {
+        let total = Self::total_events_internal(env);
         if index >= total {
-            return Vec::new(&env);
+            return Vec::new(env);
         }
 
         if let Some(versions) = env
@@ -3030,7 +3923,7 @@ impl AuditLedger {
         let event_id: BytesN<32> = env.storage().instance().get(&DataKey::EventOrder(index)).unwrap();
         let event: Event = env.storage().instance().get(&DataKey::EventData(event_id)).unwrap();
 
-        let mut history = Vec::new(&env);
+        let mut history = Vec::new(env);
         history.push_back(EventVersion {
             version: 0,
             data: event.clone(),
@@ -3038,6 +3931,12 @@ impl AuditLedger {
             updated_by: event.submitter,
         });
         history
+    }
+
+    pub fn get_event_history(env: Env, index: u32) -> Vec<EventVersion> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        Self::get_event_history_internal(&env, index)
     }
 
     /// Roll back an event to a specific version from its history (issue #204).
@@ -3048,15 +3947,17 @@ impl AuditLedger {
     ///
     /// Returns the new content-addressed event ID after rollback.
     pub fn rollback_event(env: Env, caller: Address, index: u32, target_version: u32) -> BytesN<32> {
+        Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_log_events_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         if index >= total {
             panic_with_error!(&env, ContractError::EventDoesNotExist);
         }
 
-        let history = Self::get_event_history(env.clone(), index);
+        let history = Self::get_event_history_internal(&env, index);
         if target_version >= history.len() as u32 {
             panic_with_error!(&env, ContractError::InvalidVersion);
         }
@@ -3130,9 +4031,8 @@ impl AuditLedger {
         env.storage()
             .instance()
             .set(&DataKey::EventData(new_id.clone()), &updated_event);
-        env.storage()
-            .instance()
-            .set(&DataKey::EventOrder(index), &new_id);
+        env.storage().instance().set(&DataKey::EventOrder(index), &new_id);
+        Self::record_historical_event(&env, new_id.clone(), updated_event.clone());
         env.storage().instance().set(
             &DataKey::EventHeaderKey(new_id.clone()),
             &EventHeader {
@@ -3170,6 +4070,7 @@ impl AuditLedger {
             env.storage()
                 .instance()
                 .set(&DataKey::EventMeta(event_id.clone()), &later_event);
+            Self::record_historical_event(&env, event_id.clone(), later_event.clone());
             next_prev_hash = later_event.event_hash.clone();
         }
 
@@ -3183,7 +4084,9 @@ impl AuditLedger {
 
     /// Return the number of recorded versions for an event (including version 0).
     pub fn get_event_version_count(env: Env, index: u32) -> u32 {
-        let history = Self::get_event_history(env.clone(), index);
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let history = Self::get_event_history_internal(&env, index);
         history.len() as u32
     }
 
@@ -3191,7 +4094,9 @@ impl AuditLedger {
     ///
     /// Returns -1 if version_a metadata is shorter, 0 if equal, 1 if longer.
     pub fn compare_event_versions(env: Env, index: u32, version_a: u32, version_b: u32) -> i32 {
-        let history = Self::get_event_history(env.clone(), index);
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let history = Self::get_event_history_internal(&env, index);
         if history.is_empty() {
             return 0;
         }
@@ -3211,13 +4116,15 @@ impl AuditLedger {
     /// `prev_hash` matches the previous event's `event_hash`.
     pub fn verify_integrity(env: Env) -> bool {
         Self::require_initialized(&env);
-        let total = Self::total_events(env.clone());
+        Self::require_queries_not_paused(&env);
+        let total = Self::total_events_internal(&env);
         Self::verify_range(&env, 0, total)
     }
 
     /// Verify a range `[from, to)` of the hash chain.
     pub fn verify_integrity_range(env: Env, from: u32, to: u32) -> bool {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         Self::verify_range(&env, from, to)
     }
 
@@ -3229,9 +4136,10 @@ impl AuditLedger {
     pub fn create_snapshot(env: Env, caller: Address, description: Bytes) -> u32 {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         let timestamp = env.ledger().timestamp();
 
         let event_hash: BytesN<32> = if total == 0 {
@@ -3282,6 +4190,7 @@ impl AuditLedger {
     /// Retrieve a snapshot by its ID.
     pub fn get_snapshot(env: Env, snapshot_id: u32) -> Snapshot {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage()
             .instance()
             .get(&DataKey::SnapshotData(snapshot_id))
@@ -3291,6 +4200,7 @@ impl AuditLedger {
     /// Return the total number of snapshots that have been created.
     pub fn snapshot_count(env: Env) -> u32 {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage()
             .instance()
             .get(&DataKey::SnapshotCount)
@@ -3302,13 +4212,14 @@ impl AuditLedger {
     /// by re-walking the chain up to the snapshot's event_count.
     pub fn verify_snapshot(env: Env, snapshot_id: u32) -> bool {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let snapshot: Snapshot = env
             .storage()
             .instance()
             .get(&DataKey::SnapshotData(snapshot_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::SnapshotNotFound));
 
-        let current_total = Self::total_events(env.clone());
+        let current_total = Self::total_events_internal(&env);
 
         // Snapshot must reference events that still exist.
         if snapshot.event_count > current_total {
@@ -3340,9 +4251,10 @@ impl AuditLedger {
     pub fn cleanup_stale_hashes(env: Env, caller: Address, start_index: u32, batch_size: u32) -> u32 {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         let mut cleaned: u32 = 0;
         let mut idx = start_index;
         let end = (start_index + batch_size).min(total);
@@ -3389,12 +4301,9 @@ impl AuditLedger {
     pub fn set_global_max_logs(env: Env, caller: Address, new_max: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
-        // governance writes should be blocked while paused
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
-        let total_events = Self::total_events(env.clone());
+        let total_events = Self::total_events_internal(&env);
         if new_max < total_events {
             panic_with_error!(&env, ContractError::MaxLogsBelowCurrentCount);
         }
@@ -3416,9 +4325,7 @@ impl AuditLedger {
     pub fn set_event_max_logs(env: Env, caller: Address, event_type: Symbol, new_max: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         // --- issue #63: validate event_type Symbol ---
         Self::validate_event_type(&env, &event_type);
@@ -3450,9 +4357,7 @@ impl AuditLedger {
     pub fn remove_event_cap(env: Env, caller: Address, event_type: Symbol) {
         Self::require_initialized(&env);
         caller.require_auth();
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         if !env
             .storage()
@@ -3485,15 +4390,14 @@ impl AuditLedger {
 
     pub fn has_cap(env: Env, event_type: Symbol) -> bool {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage().instance().has(&DataKey::EventCapConfig(event_type))
     }
 
     pub fn transfer_ownership(env: Env, caller: Address, new_owner: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         let current_owner: Address = env.storage().instance().get(&DataKey::Owner).unwrap();
         if new_owner == Address::from_str(&env, NULL_ACCOUNT) {
@@ -3512,6 +4416,13 @@ impl AuditLedger {
             }
         }
         env.storage().instance().set(&DataKey::Owners, &owners);
+        // Issue #365: keep RBAC roles consistent with ownership.
+        if Self::rbac_enabled(&env) {
+            env.storage().instance().set(&DataKey::Role(new_owner.clone()), &Role::Admin);
+            if Self::get_role_of(&env, &current_owner) == Some(Role::Admin) {
+                env.storage().instance().remove(&DataKey::Role(current_owner.clone()));
+            }
+        }
         env.events().publish(
             (Symbol::new(&env, "governance"), Symbol::new(&env, "transfer_ownership")),
             (caller, current_owner, new_owner),
@@ -3526,9 +4437,7 @@ impl AuditLedger {
     pub fn set_metadata_max_size(env: Env, caller: Address, max_size: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::GlobalMetadataMaxSize, &max_size);
         if let Some(mut rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
@@ -3542,9 +4451,7 @@ impl AuditLedger {
     pub fn set_event_metadata_max_size(env: Env, caller: Address, event_type: Symbol, max_size: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage()
             .instance()
@@ -3559,9 +4466,7 @@ impl AuditLedger {
     pub fn set_metadata_schema(env: Env, caller: Address, event_type: Symbol, schema: Bytes) {
         Self::require_initialized(&env);
         caller.require_auth();
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::MetadataSchema(event_type.clone()), &schema);
         env.events().publish(
@@ -3573,10 +4478,141 @@ impl AuditLedger {
     /// Return the metadata validation schema for `event_type`, or empty `Bytes` if none is configured (issue #202).
     pub fn get_metadata_schema(env: Env, event_type: Symbol) -> Bytes {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage()
             .instance()
             .get(&DataKey::MetadataSchema(event_type))
             .unwrap_or_else(|| Bytes::new(&env))
+    }
+
+    /// Register or replace a versioned schema for an event type.
+    pub fn register_schema(env: Env, caller: Address, event_type: Symbol, schema: Schema, version: u32) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_governance_not_paused(&env);
+        Self::require_owner_or_multisig(&env, &caller);
+        if version == 0 || schema.version != version {
+            panic_with_error!(&env, ContractError::InvalidVersion);
+        }
+        let mut versions: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SchemaVersions(event_type.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !Self::contains_u32(&versions, version) {
+            Self::insert_u32_sorted(&mut versions, version);
+            env.storage().instance().set(&DataKey::SchemaVersions(event_type.clone()), &versions);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EventSchema(event_type.clone(), version), &schema);
+        env.events().publish(
+            (Symbol::new(&env, "governance"), Symbol::new(&env, "register_schema")),
+            (caller, event_type, version),
+        );
+    }
+
+    /// Return the schema for an event type and version, if present.
+    pub fn get_schema(env: Env, event_type: Symbol, version: u32) -> Option<Schema> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        env.storage().instance().get(&DataKey::EventSchema(event_type, version))
+    }
+
+    /// Return all schema versions registered for an event type.
+    pub fn list_schemas(env: Env, event_type: Symbol) -> Vec<u32> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersions(event_type))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Record a migration path between two schema versions.
+    pub fn migrate_event_metadata(
+        env: Env,
+        caller: Address,
+        event_type: Symbol,
+        from_version: u32,
+        to_version: u32,
+        migration_fn: MigrationFunction,
+    ) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_governance_not_paused(&env);
+        Self::require_owner_or_multisig(&env, &caller);
+        if from_version == 0 || to_version == 0 || from_version == to_version {
+            panic_with_error!(&env, ContractError::InvalidVersion);
+        }
+        if migration_fn.from_version != from_version || migration_fn.to_version != to_version {
+            panic_with_error!(&env, ContractError::InvalidVersion);
+        }
+        env.storage().instance().set(
+            &DataKey::EventSchemaMigration(event_type.clone(), from_version, to_version),
+            &migration_fn,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "governance"), Symbol::new(&env, "migrate_event_metadata")),
+            (caller, event_type, from_version, to_version),
+        );
+    }
+
+    /// Return the migration function registered between two schema versions.
+    pub fn get_migration_function(
+        env: Env,
+        event_type: Symbol,
+        from_version: u32,
+        to_version: u32,
+    ) -> Option<MigrationFunction> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::EventSchemaMigration(event_type, from_version, to_version))
+    }
+
+    /// Check compatibility for a schema evolution.
+    pub fn check_schema_compatibility(env: Env, left: Schema, right: Schema) -> SchemaCompatibility {
+        Self::require_initialized(&env);
+        if left.format != right.format {
+            return SchemaCompatibility::Breaking;
+        }
+        if left.definition == right.definition && left.version == right.version {
+            return SchemaCompatibility::Full;
+        }
+        let left_required = Self::required_fields(&env, &left.definition);
+        let right_required = Self::required_fields(&env, &right.definition);
+        if left_required == right_required {
+            return SchemaCompatibility::Full;
+        }
+        if Self::contains_all(&left_required, &right_required) && !Self::contains_all(&right_required, &left_required) {
+            return SchemaCompatibility::Backward;
+        }
+        if Self::contains_all(&right_required, &left_required) && !Self::contains_all(&left_required, &right_required) {
+            return SchemaCompatibility::Forward;
+        }
+        if left.version < right.version {
+            return SchemaCompatibility::Breaking;
+        }
+        if left.version > right.version {
+            return SchemaCompatibility::Breaking;
+        }
+        SchemaCompatibility::Unknown
+    }
+
+    /// Return true when a new schema remains compatible with previously emitted data.
+    pub fn is_backward_compatible(env: Env, left: Schema, right: Schema) -> bool {
+        Self::require_initialized(&env);
+        let compatibility = Self::check_schema_compatibility(env.clone(), left, right);
+        compatibility == SchemaCompatibility::Full || compatibility == SchemaCompatibility::Backward
+    }
+
+    /// Return true when older readers can still consume data from the new schema.
+    pub fn is_forward_compatible(env: Env, left: Schema, right: Schema) -> bool {
+        Self::require_initialized(&env);
+        let compatibility = Self::check_schema_compatibility(env.clone(), left, right);
+        compatibility == SchemaCompatibility::Full || compatibility == SchemaCompatibility::Forward
     }
 
     /// Set the TTL for events written to persistent storage (#121).
@@ -3590,9 +4626,7 @@ impl AuditLedger {
     pub fn set_event_ttl(env: Env, caller: Address, ttl_ledgers: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
-        if let Some(true) = env.storage().instance().get::<_, bool>(&DataKey::Paused) {
-            panic_with_error!(&env, ContractError::ContractPaused);
-        }
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         let old_ttl: u32 = env.storage().instance().get(&DataKey::EventTtl).unwrap_or(0);
         env.storage().instance().set(&DataKey::EventTtl, &ttl_ledgers);
@@ -3604,6 +4638,8 @@ impl AuditLedger {
 
     /// Return the currently configured TTL in ledgers, or 0 if disabled.
     pub fn get_event_ttl(env: Env) -> u32 {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage().instance().get(&DataKey::EventTtl).unwrap_or(0)
     }
 
@@ -3621,6 +4657,7 @@ impl AuditLedger {
     pub fn cleanup_expired_events(env: Env, caller: Address, start_index: u32, batch_size: u32) -> u32 {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
 
         let ttl: u32 = env.storage().instance().get(&DataKey::EventTtl).unwrap_or(0);
@@ -3629,7 +4666,7 @@ impl AuditLedger {
             return 0;
         }
 
-        let total = Self::total_events(env.clone());
+        let total = Self::total_events_internal(&env);
         let end = if start_index.saturating_add(batch_size) < total {
             start_index + batch_size
         } else {
@@ -3674,6 +4711,8 @@ impl AuditLedger {
 
     /// Return cumulative TTL cleanup statistics (issue #200).
     pub fn get_cleanup_stats(env: Env) -> TtlCleanupStats {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage()
             .instance()
             .get(&DataKey::TtlCleanupStats)
@@ -3687,6 +4726,7 @@ impl AuditLedger {
     pub fn register_webhook(env: Env, caller: Address, event_type: Symbol, url: Bytes, secret: Bytes) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner(&env, &caller);
         let entry = WebhookEntry {
             url: url.clone(),
@@ -3708,6 +4748,7 @@ impl AuditLedger {
     pub fn unregister_webhook(env: Env, caller: Address, event_type: Symbol, url: Bytes) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner(&env, &caller);
         let key = DataKey::WebhookRegistrations(event_type.clone());
         let list: Vec<WebhookEntry> = env.storage().instance().get(&key).unwrap_or_else(|| Vec::new(&env));
@@ -3729,6 +4770,8 @@ impl AuditLedger {
 
     /// Return registered webhooks for an event type (URLs only, secrets are not exposed) (#25).
     pub fn get_webhooks(env: Env, event_type: Symbol) -> Vec<Bytes> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let list: Vec<WebhookEntry> = env
             .storage()
             .instance()
@@ -3736,7 +4779,7 @@ impl AuditLedger {
             .unwrap_or_else(|| Vec::new(&env));
         let mut urls: Vec<Bytes> = Vec::new(&env);
         for entry in list.iter() {
-            urls.push_back(entry.url);
+            urls.push_back(entry.url.clone());
         }
         urls
     }
@@ -3746,46 +4789,285 @@ impl AuditLedger {
         Self::require_initialized(&env);
         caller.require_auth();
         Self::require_owner_or_multisig(&env, &caller);
-        let _already_paused = env
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::PausedSince, &now);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseConfig, &PauseConfig::all_paused());
+        if let Some(mut rs) = env
             .storage()
             .instance()
-            .get::<_, bool>(&DataKey::Paused)
-            .unwrap_or(false);
-        env.storage().instance().set(&DataKey::Paused, &true);
+            .get::<_, RuntimeState>(&DataKey::RuntimeState)
+        {
+            rs.paused = true;
+            env.storage().instance().set(&DataKey::RuntimeState, &rs);
+        }
         env.events().publish((Symbol::new(&env, "contract_paused"),), (caller,));
     }
 
-    /// Unpause write operations. Owner-only.
+    /// Pause contract operations with reason, metadata, and optional duration in seconds. Owner-only.
+    pub fn pause_with_details(
+        env: Env,
+        caller: Address,
+        reason: String,
+        metadata: Bytes,
+        duration: u64,
+    ) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_owner_or_multisig(&env, &caller);
+
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::PausedSince, &now);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseConfig, &PauseConfig::all_paused());
+
+        if duration > 0 {
+            let expires_at = now.saturating_add(duration);
+            env.storage().instance().set(&DataKey::PauseExpiration, &expires_at);
+        } else {
+            env.storage().instance().remove(&DataKey::PauseExpiration);
+        }
+        env.storage().instance().set(&DataKey::PauseReason, &reason);
+        env.storage().instance().set(&DataKey::PauseMetadata, &metadata);
+
+        if let Some(mut rs) = env
+            .storage()
+            .instance()
+            .get::<_, RuntimeState>(&DataKey::RuntimeState)
+        {
+            rs.paused = true;
+            env.storage().instance().set(&DataKey::RuntimeState, &rs);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_paused"),),
+            (caller, reason, duration),
+        );
+    }
+
+    /// Set granular pause configuration per operation type (owner-only).
+    pub fn set_pause_config(env: Env, caller: Address, config: PauseConfig) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_owner_or_multisig(&env, &caller);
+
+        let now = env.ledger().timestamp();
+        let was_paused = Self::is_paused(env.clone());
+        let is_any_paused = config.is_any_paused();
+
+        if is_any_paused && !was_paused {
+            env.storage().instance().set(&DataKey::PausedSince, &now);
+        } else if !is_any_paused {
+            env.storage().instance().remove(&DataKey::PausedSince);
+            env.storage().instance().remove(&DataKey::PauseExpiration);
+            env.storage().instance().remove(&DataKey::PauseReason);
+            env.storage().instance().remove(&DataKey::PauseMetadata);
+        }
+
+        env.storage().instance().set(&DataKey::Paused, &is_any_paused);
+        env.storage().instance().set(&DataKey::PauseConfig, &config);
+
+        if let Some(mut rs) = env
+            .storage()
+            .instance()
+            .get::<_, RuntimeState>(&DataKey::RuntimeState)
+        {
+            rs.paused = config.log_events;
+            env.storage().instance().set(&DataKey::RuntimeState, &rs);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "pause_config_set"),),
+            (caller, config),
+        );
+    }
+
+    /// Set granular pause configuration with reason, metadata, and expiration duration (owner-only).
+    pub fn set_pause_config_with_details(
+        env: Env,
+        caller: Address,
+        config: PauseConfig,
+        reason: String,
+        metadata: Bytes,
+        duration: u64,
+    ) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_owner_or_multisig(&env, &caller);
+
+        let now = env.ledger().timestamp();
+        let is_any_paused = config.is_any_paused();
+
+        if is_any_paused {
+            env.storage().instance().set(&DataKey::PausedSince, &now);
+            if duration > 0 {
+                let expires_at = now.saturating_add(duration);
+                env.storage().instance().set(&DataKey::PauseExpiration, &expires_at);
+            } else {
+                env.storage().instance().remove(&DataKey::PauseExpiration);
+            }
+            env.storage().instance().set(&DataKey::PauseReason, &reason);
+            env.storage().instance().set(&DataKey::PauseMetadata, &metadata);
+        } else {
+            env.storage().instance().remove(&DataKey::PausedSince);
+            env.storage().instance().remove(&DataKey::PauseExpiration);
+            env.storage().instance().remove(&DataKey::PauseReason);
+            env.storage().instance().remove(&DataKey::PauseMetadata);
+        }
+
+        env.storage().instance().set(&DataKey::Paused, &is_any_paused);
+        env.storage().instance().set(&DataKey::PauseConfig, &config);
+
+        if let Some(mut rs) = env
+            .storage()
+            .instance()
+            .get::<_, RuntimeState>(&DataKey::RuntimeState)
+        {
+            rs.paused = config.log_events;
+            env.storage().instance().set(&DataKey::RuntimeState, &rs);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "pause_config_set"),),
+            (caller, config, reason, duration),
+        );
+    }
+
+    /// Unpause contract operations. Owner-only.
     pub fn unpause(env: Env, caller: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseConfig, &PauseConfig::default());
         env.storage().instance().remove(&DataKey::PausedSince);
+        env.storage().instance().remove(&DataKey::PauseExpiration);
+        env.storage().instance().remove(&DataKey::PauseReason);
+        env.storage().instance().remove(&DataKey::PauseMetadata);
+
+        if let Some(mut rs) = env
+            .storage()
+            .instance()
+            .get::<_, RuntimeState>(&DataKey::RuntimeState)
+        {
+            rs.paused = false;
+            env.storage().instance().set(&DataKey::RuntimeState, &rs);
+        }
+
         env.events()
             .publish((Symbol::new(&env, "contract_unpaused"),), (caller,));
     }
 
     /// Returns true if the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
+        Self::check_auto_unpause(&env);
+        let paused_flag = env
+            .storage()
             .instance()
             .get::<_, bool>(&DataKey::Paused)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if paused_flag {
+            return true;
+        }
+        let cfg: Option<PauseConfig> = env.storage().instance().get(&DataKey::PauseConfig);
+        cfg.map_or(false, |c| c.is_any_paused())
     }
 
     /// Returns the timestamp when the contract was paused, or 0 if not paused.
     pub fn paused_since(env: Env) -> u64 {
+        if !Self::is_paused(env.clone()) {
+            return 0;
+        }
         env.storage()
             .instance()
             .get::<_, u64>(&DataKey::PausedSince)
             .unwrap_or(0)
     }
 
+    /// Get current granular pause configuration.
+    pub fn get_pause_config(env: Env) -> PauseConfig {
+        Self::get_effective_pause_config(&env)
+    }
+
+    /// Returns the reason for pause, or empty string if not paused.
+    pub fn get_pause_reason(env: Env) -> String {
+        Self::check_auto_unpause(&env);
+        if !Self::is_paused(env.clone()) {
+            return String::from_str(&env, "");
+        }
+        env.storage()
+            .instance()
+            .get::<_, String>(&DataKey::PauseReason)
+            .unwrap_or_else(|| String::from_str(&env, ""))
+    }
+
+    /// Returns the metadata for pause, or empty Bytes if not set.
+    pub fn get_pause_metadata(env: Env) -> Bytes {
+        Self::check_auto_unpause(&env);
+        if !Self::is_paused(env.clone()) {
+            return Bytes::new(&env);
+        }
+        env.storage()
+            .instance()
+            .get::<_, Bytes>(&DataKey::PauseMetadata)
+            .unwrap_or_else(|| Bytes::new(&env))
+    }
+
+    /// Returns timestamp when pause expires, or 0 if no expiration is set.
+    pub fn get_pause_expiration(env: Env) -> u64 {
+        Self::check_auto_unpause(&env);
+        if !Self::is_paused(env.clone()) {
+            return 0;
+        }
+        env.storage()
+            .instance()
+            .get::<_, u64>(&DataKey::PauseExpiration)
+            .unwrap_or(0)
+    }
+
+    /// Returns granular pause status for a specific operation: "log_events", "governance", or "queries".
+    pub fn is_operation_paused(env: Env, operation: Symbol) -> bool {
+        let cfg = Self::get_effective_pause_config(&env);
+        if operation == Symbol::new(&env, "log_events") {
+            cfg.log_events
+        } else if operation == Symbol::new(&env, "governance") {
+            cfg.governance
+        } else if operation == Symbol::new(&env, "queries") {
+            cfg.queries
+        } else {
+            Self::is_paused(env)
+        }
+    }
+
+    /// System health check returning overall status and granular pause state.
+    pub fn health_check(env: Env) -> HealthStatus {
+        Self::require_initialized(&env);
+        let cfg = Self::get_effective_pause_config(&env);
+        let paused = Self::is_paused(env.clone());
+        let paused_since = Self::paused_since(env.clone());
+        let expires_at = Self::get_pause_expiration(env.clone());
+        let total = Self::total_events_internal(&env);
+        HealthStatus {
+            is_healthy: !paused,
+            is_paused: paused,
+            pause_config: cfg,
+            paused_since,
+            expires_at,
+            total_events: total,
+        }
+    }
+
     /// Set the maximum allowed category Symbol length in bytes (owner-only).
     pub fn set_category_max_len(env: Env, caller: Address, max_len: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::CategoryMaxLen, &max_len);
     }
@@ -3795,6 +5077,7 @@ impl AuditLedger {
     pub fn block_submitter(env: Env, caller: Address, submitter: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage()
             .instance()
@@ -3807,6 +5090,7 @@ impl AuditLedger {
     pub fn unblock_submitter(env: Env, caller: Address, submitter: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage()
             .instance()
@@ -3820,6 +5104,7 @@ impl AuditLedger {
     pub fn enable_allowlist_mode(env: Env, caller: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::AllowlistMode, &true);
         if let Some(mut rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
@@ -3834,6 +5119,7 @@ impl AuditLedger {
     pub fn disable_allowlist_mode(env: Env, caller: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::AllowlistMode, &false);
         env.events()
@@ -3845,6 +5131,7 @@ impl AuditLedger {
     pub fn allow_submitter(env: Env, caller: Address, submitter: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage()
             .instance()
@@ -3857,6 +5144,7 @@ impl AuditLedger {
     pub fn remove_submitter_from_allowlist(env: Env, caller: Address, submitter: Address) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage()
             .instance()
@@ -3871,11 +5159,17 @@ impl AuditLedger {
     /// Returns the per-type cap if set, otherwise the global cap, otherwise the default.
     pub fn get_metadata_max_size(env: Env, event_type: Symbol) -> u32 {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         Self::effective_metadata_max_size(&env, &event_type)
     }
 
-    pub fn get_statistics(env: Env) -> ContractStatistics {
+    /// Contract-wide usage statistics. When RBAC is enabled, requires at least the
+    /// `Auditor` role (issue #365).
+    pub fn get_statistics(env: Env, caller: Address) -> ContractStatistics {
         Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_role_min(&env, &caller, Role::Auditor);
+        Self::require_queries_not_paused(&env);
         Self::collect_statistics(&env)
     }
 
@@ -3887,6 +5181,7 @@ impl AuditLedger {
     pub fn set_event_emission_mode(env: Env, caller: Address, mode: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::EventEmissionConfig, &mode);
         env.storage().instance().set(&DataKey::EventEmissionVersion, &2u32);
@@ -3899,6 +5194,7 @@ impl AuditLedger {
     /// Get the current event emission mode.
     pub fn get_event_emission_mode(env: Env) -> u32 {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if let Some(rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
             return rs.emission_mode;
         }
@@ -3911,6 +5207,7 @@ impl AuditLedger {
     pub fn set_low_cost_mode(env: Env, caller: Address, enabled: bool) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage().instance().set(&DataKey::LowCostMode, &enabled);
         if let Some(mut rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
@@ -3922,6 +5219,7 @@ impl AuditLedger {
     /// Check if low-cost mode is enabled.
     pub fn is_low_cost_mode(env: Env) -> bool {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         if let Some(rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
             return rs.low_cost_mode;
         }
@@ -3936,6 +5234,7 @@ impl AuditLedger {
     pub fn set_submitter_rate_limit(env: Env, caller: Address, submitter: Address, max_per_timestamp: u32) {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         env.storage()
             .instance()
@@ -3952,6 +5251,7 @@ impl AuditLedger {
     pub fn compact_storage(env: Env, caller: Address, stale_types: Vec<Symbol>) -> u32 {
         Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
 
         let mut removed: u32 = 0;
@@ -4036,6 +5336,7 @@ impl AuditLedger {
     /// event. Returns `None` if no signature was attached during logging.
     pub fn get_event_signature(env: Env, event_id: BytesN<32>) -> Option<Bytes> {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         env.storage().instance().get(&DataKey::EventSignature(event_id))
     }
 
@@ -4045,6 +5346,7 @@ impl AuditLedger {
     /// stored (and deduplication recorded its position), `None` otherwise.
     pub fn find_event_by_content(env: Env, event_type: Symbol, submitter: Address, metadata: Bytes) -> Option<Event> {
         Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
         let content_hash = Self::compute_content_hash(&env, &event_type, &submitter, &metadata);
         if let Some(index) = env
             .storage()
@@ -4118,6 +5420,125 @@ impl AuditLedger {
         let b3 = schema.get(3).unwrap() as u32;
         let min_len: u32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         metadata.len() >= min_len
+    }
+
+    fn contains_u32(values: &Vec<u32>, target: u32) -> bool {
+        for i in 0..values.len() {
+            if values.get(i).unwrap() == target {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn insert_u32_sorted(values: &mut Vec<u32>, target: u32) {
+        let mut inserted = false;
+        for i in 0..values.len() {
+            if values.get(i).unwrap() > target {
+                values.insert(i, target);
+                inserted = true;
+                break;
+            }
+        }
+        if !inserted {
+            values.push_back(target);
+        }
+    }
+
+    fn contains_all(left: &Vec<String>, right: &Vec<String>) -> bool {
+        for i in 0..right.len() {
+            let value = right.get(i).unwrap();
+            let mut found = false;
+            for j in 0..left.len() {
+                if left.get(j).unwrap() == value {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when `data` contains `pattern` at byte offset `at`.
+    fn matches_at(data: &Bytes, at: u32, pattern: &[u8]) -> bool {
+        if at + pattern.len() as u32 > data.len() {
+            return false;
+        }
+        for (offset, expected) in pattern.iter().enumerate() {
+            if data.get(at + offset as u32) != Some(*expected) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Metadata schema definitions are bounded by the contract's metadata size
+    /// limit, so the JSON is scanned in place on the host `Bytes` object: no guest
+    /// heap (and therefore no global allocator) is required.
+    fn required_fields(env: &Env, definition: &Bytes) -> Vec<String> {
+        const MAX_DEFINITION_LEN: u32 = 4096;
+        let mut result: Vec<String> = Vec::new(env);
+        if definition.is_empty() || definition.len() > MAX_DEFINITION_LEN {
+            return result;
+        }
+        let len = definition.len();
+        let required_key = b"\"required\"";
+        let mut i = 0u32;
+        while i + required_key.len() as u32 <= len {
+            if !Self::matches_at(definition, i, required_key) {
+                i += 1;
+                continue;
+            }
+            let mut j = i + required_key.len() as u32;
+            if j >= len || definition.get(j) != Some(b'[') {
+                i = j;
+                continue;
+            }
+            j += 1;
+            while j < len {
+                match definition.get(j) {
+                    Some(b'"') => {
+                        let name_start = j + 1;
+                        let mut k = name_start;
+                        let mut name_end = None;
+                        while k < len {
+                            if definition.get(k) == Some(b'"') {
+                                name_end = Some(k);
+                                break;
+                            }
+                            k += 1;
+                        }
+                        match name_end {
+                            Some(end) => {
+                                if end > name_start {
+                                    let mut name = [0u8; 128];
+                                    let name_len = (end - name_start) as usize;
+                                    if name_len <= name.len() {
+                                        definition
+                                            .slice(name_start..end)
+                                            .copy_into_slice(&mut name[..name_len]);
+                                        if let Ok(text) =
+                                            core::str::from_utf8(&name[..name_len])
+                                        {
+                                            result.push_back(String::from_str(env, text));
+                                        }
+                                    }
+                                }
+                                j = end + 1;
+                            }
+                            None => return result,
+                        }
+                    }
+                    Some(b']') => return result,
+                    _ => j += 1,
+                }
+            }
+            return result;
+        }
+        result
     }
 
     /// Panic with `MetadataSchemaViolation` if `metadata` does not satisfy the
@@ -4237,6 +5658,78 @@ impl AuditLedger {
         }
     }
 
+    // ── RBAC helpers (issue #365) ────────────────────────────────────────────
+
+    /// Whether role-based access control is currently enforced.
+    fn rbac_enabled(env: &Env) -> bool {
+        env.storage().instance().get(&DataKey::RbacEnabled).unwrap_or(false)
+    }
+
+    /// Look up the role assigned to `addr`.
+    fn get_role_of(env: &Env, addr: &Address) -> Option<Role> {
+        env.storage().instance().get(&DataKey::Role(addr.clone()))
+    }
+
+    /// Enforce a minimum role when RBAC is enabled. In compatibility mode
+    /// (RBAC disabled) this is a no-op, preserving legacy behaviour.
+    fn require_role_min(env: &Env, addr: &Address, min: Role) {
+        if !Self::rbac_enabled(env) {
+            return;
+        }
+        let granted = Self::get_role_of(env, addr).unwrap_or(Role::Viewer);
+        if granted.rank() < min.rank() {
+            panic_with_error!(env, ContractError::RoleNotGranted);
+        }
+    }
+
+    /// Legacy owner/multisig check. When RBAC is enabled, ownership checks are
+    /// replaced by the Admin role (all owners are seeded as Admins at init).
+    fn require_owner_or_multisig(env: &Env, addr: &Address) {
+        if Self::rbac_enabled(env) {
+            Self::require_role_min(env, addr, Role::Admin);
+            return;
+        }
+        if !Self::is_addr_owner(env, addr) {
+            panic_with_error!(env, ContractError::CallerNotOwner);
+        }
+    }
+
+    // ── Deduplication policy helpers (issue #366) ───────────────────────────
+
+    /// Effective dedup policy for an event type: per-type override, else global, else
+    /// `ContentHash` (legacy behaviour).
+    fn effective_dedup_policy(env: &Env, event_type: &Symbol) -> DedupPolicy {
+        if let Some(policy) = env
+            .storage()
+            .instance()
+            .get::<_, DedupPolicy>(&DataKey::DedupPolicyConfigForType(event_type.clone()))
+        {
+            return policy;
+        }
+        env.storage()
+            .instance()
+            .get::<_, DedupPolicy>(&DataKey::DedupPolicyConfig)
+            .unwrap_or(DedupPolicy::ContentHash)
+    }
+
+    /// Validate a `u32` discriminant as a `DedupPolicy`.
+    fn dedup_policy_from_discriminant(env: &Env, disc: u32) -> DedupPolicy {
+        match disc {
+            0 => DedupPolicy::None,
+            1 => DedupPolicy::ContentHash,
+            2 => DedupPolicy::ContentHashWithTimestamp,
+            3 => DedupPolicy::Custom,
+            _ => panic_with_error!(env, ContractError::InvalidDedupPolicy),
+        }
+    }
+
+    /// Read the transient custom-dedup key for the current call (if any).
+    fn pending_custom_key(env: &Env) -> Option<BytesN<32>> {
+        env.storage()
+            .temporary()
+            .get::<_, BytesN<32>>(&DataKey::PendingCustomDedupKey)
+    }
+
     fn get_owners(env: &Env) -> Vec<Address> {
         env.storage()
             .instance()
@@ -4267,14 +5760,10 @@ impl AuditLedger {
         false
     }
 
-    fn require_owner_or_multisig(env: &Env, addr: &Address) {
-        if !Self::is_addr_owner(env, addr) {
-            panic_with_error!(env, ContractError::CallerNotOwner);
-        }
-    }
-
     pub fn add_owner(env: Env, caller: Address, new_owner: Address) {
+        Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         if new_owner == Address::from_str(&env, NULL_ACCOUNT) {
             panic_with_error!(&env, ContractError::NewOwnerIsZero);
@@ -4287,11 +5776,17 @@ impl AuditLedger {
         }
         owners.push_back(new_owner.clone());
         env.storage().instance().set(&DataKey::Owners, &owners);
+        // Issue #365: seed the Admin role for the new owner.
+        if Self::rbac_enabled(&env) {
+            env.storage().instance().set(&DataKey::Role(new_owner.clone()), &Role::Admin);
+        }
         env.events().publish((Symbol::new(&env, "owner_added"),), (new_owner,));
     }
 
     pub fn remove_owner(env: Env, caller: Address, owner_to_remove: Address) {
+        Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         let owners = Self::get_owners(&env);
         let mut found = false;
@@ -4321,7 +5816,9 @@ impl AuditLedger {
     }
 
     pub fn set_required_signatures(env: Env, caller: Address, required: u32) {
+        Self::require_initialized(&env);
         caller.require_auth();
+        Self::require_governance_not_paused(&env);
         Self::require_owner_or_multisig(&env, &caller);
         let owners = Self::get_owners(&env);
         if required == 0 || required > owners.len() {
@@ -4333,7 +5830,11 @@ impl AuditLedger {
     }
 
     pub fn submit_proposal(env: Env, proposer: Address, action: ProposalAction, ttl_seconds: u64) -> u32 {
+        Self::require_initialized(&env);
         proposer.require_auth();
+        if action != ProposalAction::Unpause {
+            Self::require_governance_not_paused(&env);
+        }
         if !Self::is_addr_owner(&env, &proposer) {
             panic_with_error!(&env, ContractError::CallerNotOwner);
         }
@@ -4386,6 +5887,7 @@ impl AuditLedger {
     }
 
     pub fn execute_proposal(env: Env, executor: Address, proposal_id: u32) {
+        Self::require_initialized(&env);
         executor.require_auth();
         if !Self::is_addr_owner(&env, &executor) {
             panic_with_error!(&env, ContractError::CallerNotOwner);
@@ -4397,6 +5899,9 @@ impl AuditLedger {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EventDoesNotExist));
         if prop.executed {
             return;
+        }
+        if prop.action != ProposalAction::Unpause {
+            Self::require_governance_not_paused(&env);
         }
         let now = env.ledger().timestamp();
         if prop.expires_at < now {
@@ -4451,16 +5956,277 @@ impl AuditLedger {
                 let _ = Self::rollback_event(env.clone(), executor.clone(), index, target_version);
             }
             ProposalAction::Pause => {
+                let now = env.ledger().timestamp();
                 env.storage().instance().set(&DataKey::Paused, &true);
+                env.storage().instance().set(&DataKey::PausedSince, &now);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PauseConfig, &PauseConfig::all_paused());
+                if let Some(mut rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
+                    rs.paused = true;
+                    env.storage().instance().set(&DataKey::RuntimeState, &rs);
+                }
             }
             ProposalAction::Unpause => {
                 env.storage().instance().set(&DataKey::Paused, &false);
+                env.storage().instance().set(&DataKey::PauseConfig, &PauseConfig::default());
+                env.storage().instance().remove(&DataKey::PausedSince);
+                env.storage().instance().remove(&DataKey::PauseExpiration);
+                env.storage().instance().remove(&DataKey::PauseReason);
+                env.storage().instance().remove(&DataKey::PauseMetadata);
+                if let Some(mut rs) = env.storage().instance().get::<_, RuntimeState>(&DataKey::RuntimeState) {
+                    rs.paused = false;
+                    env.storage().instance().set(&DataKey::RuntimeState, &rs);
+                }
             }
         }
         prop.executed = true;
         env.storage().instance().set(&DataKey::Proposal(proposal_id), &prop);
         env.events()
             .publish((Symbol::new(&env, "proposal_executed"),), (proposal_id, executor));
+    }
+
+    /// Checks if a timed pause has expired, and auto-unpauses if so.
+    /// Emits `contract_auto_unpaused` event when expired.
+    pub fn check_auto_unpause(env: &Env) -> bool {
+        let is_paused = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false);
+        let config: PauseConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseConfig)
+            .unwrap_or_else(|| {
+                if is_paused {
+                    PauseConfig::all_paused()
+                } else {
+                    PauseConfig::default()
+                }
+            });
+
+        if is_paused || config.is_any_paused() {
+            let expires_at = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::PauseExpiration)
+                .unwrap_or(0);
+            if expires_at > 0 && env.ledger().timestamp() >= expires_at {
+                env.storage().instance().set(&DataKey::Paused, &false);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PauseConfig, &PauseConfig::default());
+                env.storage().instance().remove(&DataKey::PausedSince);
+                env.storage().instance().remove(&DataKey::PauseExpiration);
+                env.storage().instance().remove(&DataKey::PauseReason);
+                env.storage().instance().remove(&DataKey::PauseMetadata);
+
+                if let Some(mut rs) = env
+                    .storage()
+                    .instance()
+                    .get::<_, RuntimeState>(&DataKey::RuntimeState)
+                {
+                    rs.paused = false;
+                    env.storage().instance().set(&DataKey::RuntimeState, &rs);
+                }
+
+                env.events().publish(
+                    (Symbol::new(env, "contract_auto_unpaused"),),
+                    (expires_at, env.ledger().timestamp()),
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the effective PauseConfig (evaluating auto-unpause first).
+    pub fn get_effective_pause_config(env: &Env) -> PauseConfig {
+        Self::check_auto_unpause(env);
+        let is_paused = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false);
+        let stored_cfg: Option<PauseConfig> = env.storage().instance().get(&DataKey::PauseConfig);
+        match stored_cfg {
+            Some(mut cfg) => {
+                if is_paused {
+                    cfg.log_events = true;
+                    cfg.governance = true;
+                    cfg.queries = true;
+                }
+                cfg
+            }
+            None => {
+                if is_paused {
+                    PauseConfig::all_paused()
+                } else {
+                    PauseConfig::default()
+                }
+            }
+        }
+    }
+
+    /// Check if event logging operations are paused.
+    pub fn is_log_events_paused(env: &Env) -> bool {
+        let cfg = Self::get_effective_pause_config(env);
+        cfg.log_events
+    }
+
+    /// Check if governance operations are paused.
+    pub fn is_governance_paused(env: &Env) -> bool {
+        let cfg = Self::get_effective_pause_config(env);
+        cfg.governance
+    }
+
+    /// Check if queries are paused.
+    pub fn is_queries_paused(env: &Env) -> bool {
+        let cfg = Self::get_effective_pause_config(env);
+        cfg.queries
+    }
+
+    /// Require that event logging operations are not paused.
+    pub fn require_log_events_not_paused(env: &Env) {
+        if Self::is_log_events_paused(env) {
+            panic_with_error!(env, ContractError::ContractPaused);
+        }
+    }
+
+    /// Require that governance operations are not paused.
+    pub fn require_governance_not_paused(env: &Env) {
+        if Self::is_governance_paused(env) {
+            panic_with_error!(env, ContractError::ContractPaused);
+        }
+    }
+
+    /// Require that query operations are not paused.
+    pub fn require_queries_not_paused(env: &Env) {
+        if Self::is_queries_paused(env) {
+            panic_with_error!(env, ContractError::ContractPaused);
+        }
+    }
+
+    pub fn total_events_internal(env: &Env) -> u32 {
+        if let Some(rs) = env
+            .storage()
+            .instance()
+            .get::<_, RuntimeState>(&DataKey::RuntimeState)
+        {
+            return rs.total_events;
+        }
+        if let Some(cfg) = env.storage().instance().get::<_, Config>(&DataKey::Config) {
+            return cfg.total_events;
+        }
+        env.storage()
+            .instance()
+            .get::<_, u32>(&DataKey::TotalEvents)
+            .unwrap_or(0)
+    }
+
+    fn historical_count_at_ledger(snapshots: &Vec<(u32, u32)>, ledger: u32) -> u32 {
+        let mut low = 0u32;
+        let mut high = snapshots.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let (snapshot_ledger, _) = snapshots.get(mid).unwrap();
+            if snapshot_ledger <= ledger {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if low == 0 {
+            0
+        } else {
+            snapshots.get(low - 1).unwrap().1
+        }
+    }
+
+    fn historical_snapshot_by_index(env: &Env, index: u32, ledger: u32) -> HistoricalEventSnapshot {
+        let snapshots: Vec<HistoricalEventSnapshot> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HistoricalEventSnapshots(index))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut low = 0u32;
+        let mut high = snapshots.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let snapshot = snapshots.get(mid).unwrap();
+            if snapshot.ledger <= ledger {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if low == 0 {
+            panic_with_error!(env, ContractError::EventDoesNotExist);
+        }
+        snapshots.get(low - 1).unwrap()
+    }
+
+    fn record_historical_event(env: &Env, event_id: BytesN<32>, event: Event) {
+        let ledger = env.ledger().sequence();
+        let index = event.index;
+        let new_event = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::EventLedger(index))
+            .is_none();
+        env.storage()
+            .instance()
+            .set(&DataKey::HistoricalEventIndex(event_id.clone()), &index);
+
+        let mut snapshots: Vec<HistoricalEventSnapshot> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HistoricalEventSnapshots(index))
+            .unwrap_or_else(|| Vec::new(env));
+        let snapshot = HistoricalEventSnapshot {
+            ledger,
+            event_id: event_id.clone(),
+            event: event.clone(),
+        };
+        if snapshots.len() > 0 && snapshots.get(snapshots.len() - 1).unwrap().ledger == ledger {
+            snapshots.set(snapshots.len() - 1, snapshot);
+        } else {
+            snapshots.push_back(snapshot);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::HistoricalEventSnapshots(index), &snapshots);
+
+        let mut totals: Vec<(u32, u32)> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HistoricalTotals)
+            .unwrap_or_else(|| Vec::new(env));
+        let count = if new_event {
+            index.saturating_add(1)
+        } else {
+            Self::total_events_internal(env)
+        };
+        if totals.len() > 0 && totals.get(totals.len() - 1).unwrap().0 == ledger {
+            totals.set(totals.len() - 1, (ledger, count));
+        } else {
+            totals.push_back((ledger, count));
+        }
+        env.storage().instance().set(&DataKey::HistoricalTotals, &totals);
+
+        if new_event {
+            env.storage().instance().set(&DataKey::EventLedger(index), &ledger);
+            let mut type_indices: Vec<(u32, u32)> = env
+                .storage()
+                .instance()
+                .get(&DataKey::HistoricalTypeIndices(event.event_type.clone()))
+                .unwrap_or_else(|| Vec::new(env));
+            type_indices.push_back((ledger, index));
+            env.storage()
+                .instance()
+                .set(&DataKey::HistoricalTypeIndices(event.event_type), &type_indices);
+        }
     }
 
     fn event_type_count(env: &Env, event_type: Symbol) -> u32 {
@@ -4532,10 +6298,11 @@ impl AuditLedger {
         let mut expected_prev: BytesN<32> = if from == 0 {
             BytesN::from_array(env, &[0u8; 32])
         } else {
-            let prev_id: BytesN<32> = match env.storage().instance().get(&DataKey::EventOrder(from - 1)) {
-                Some(v) => v,
-                None => return false,
-            };
+            let prev_id: BytesN<32> =
+                match env.storage().instance().get(&DataKey::EventOrder(from - 1)) {
+                    Some(v) => v,
+                    None => return false,
+                };
             let prev_evt: Event = match env.storage().instance().get(&DataKey::EventData(prev_id)) {
                 Some(v) => v,
                 None => return false,
@@ -4547,7 +6314,11 @@ impl AuditLedger {
                 Some(v) => v,
                 None => return false,
             };
-            let evt: Event = match env.storage().instance().get(&DataKey::EventData(id.clone())) {
+            let evt: Event = match env
+                .storage()
+                .instance()
+                .get(&DataKey::EventData(id.clone()))
+            {
                 Some(v) => v,
                 None => return false,
             };
@@ -4605,6 +6376,8 @@ impl AuditLedger {
             events_last_day,
             events_last_week,
             top_submitters,
+            is_paused: Self::is_paused(env.clone()),
+            pause_config: Self::get_effective_pause_config(env),
         }
     }
 
@@ -4631,31 +6404,11 @@ impl AuditLedger {
     }
 
     fn u64_to_bytes(env: &Env, v: u64) -> Bytes {
-        bytes!(
-            env,
-            [
-                (v & 0xff) as u8,
-                ((v >> 8) & 0xff) as u8,
-                ((v >> 16) & 0xff) as u8,
-                ((v >> 24) & 0xff) as u8,
-                ((v >> 32) & 0xff) as u8,
-                ((v >> 40) & 0xff) as u8,
-                ((v >> 48) & 0xff) as u8,
-                ((v >> 56) & 0xff) as u8,
-            ]
-        )
+        Bytes::from_array(env, &v.to_le_bytes())
     }
 
     fn u32_to_bytes(env: &Env, v: u32) -> Bytes {
-        bytes!(
-            env,
-            [
-                (v & 0xff) as u8,
-                ((v >> 8) & 0xff) as u8,
-                ((v >> 16) & 0xff) as u8,
-                ((v >> 24) & 0xff) as u8,
-            ]
-        )
+        Bytes::from_array(env, &v.to_le_bytes())
     }
 
     fn bytes_contains(haystack: &Bytes, needle: &Bytes) -> bool {
@@ -4693,95 +6446,767 @@ impl AuditLedger {
             .unwrap_or(1000)
     }
 
-    // ── Conflict minerals reporting (Dodd-Frank §1502) ──────────────────
+    /// Default nonce max value (issue #214). u32::MAX = no upper bound.
+    fn default_nonce_max_value(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultNonceMaxValue)
+            .unwrap_or(u32::MAX)
+    }
 
-    /// Record a mineral allocation to product and smelter(s). Owner-only.
-    ///
-    /// Emits a `("cm", "alloc")` event with payload `(submitter, allocation_id, mineral)`.
-    pub fn record_mineral_allocation(
+    // ═══════════════════════════════════════════════════════════════════════
+    // RBAC (issue #365)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Assign (or clear, when `role` is `None`) a role for `target`.
+    /// Admin-only when RBAC is enabled; legacy owner/multisig otherwise.
+    pub fn set_role(env: Env, caller: Address, target: Address, role: Option<Role>) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_governance_not_paused(&env);
+        // Only an Admin may change roles.
+        if Self::rbac_enabled(&env) {
+            Self::require_role_min(&env, &caller, Role::Admin);
+        } else {
+            Self::require_owner_or_multisig(&env, &caller);
+        }
+        match role {
+            Some(r) => env.storage().instance().set(&DataKey::Role(target.clone()), &r),
+            None => env.storage().instance().remove(&DataKey::Role(target.clone())),
+        }
+        env.events().publish(
+            (Symbol::new(&env, "rbac"), Symbol::new(&env, "role_set")),
+            (caller, target, role),
+        );
+    }
+
+    /// Read the role assigned to `target`.
+    pub fn get_role(env: Env, target: Address) -> Option<Role> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        Self::get_role_of(&env, &target)
+    }
+
+    /// Toggle RBAC enforcement. Admin-only when already enabled; legacy
+    /// owner/multisig otherwise. Disabling restores full legacy behaviour.
+    pub fn enable_rbac(env: Env, caller: Address, enabled: bool) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_governance_not_paused(&env);
+        if Self::rbac_enabled(&env) {
+            Self::require_role_min(&env, &caller, Role::Admin);
+        } else {
+            Self::require_owner_or_multisig(&env, &caller);
+        }
+        env.storage().instance().set(&DataKey::RbacEnabled, &enabled);
+        env.events().publish(
+            (Symbol::new(&env, "rbac"), Symbol::new(&env, "rbac_toggled")),
+            (caller, enabled),
+        );
+    }
+
+    /// Whether RBAC is currently enforced.
+    pub fn is_rbac_enabled(env: Env) -> bool {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        Self::rbac_enabled(&env)
+    }
+
+    /// Governance dashboard: aggregate view of all admin-configurable state.
+    /// Returns a single snapshot of roles, caps, schemas, TTL, pause state,
+    /// blocklist/allowlist, rate limits, nonces, and audit counters so a UI
+    /// can render the full governance surface with one read.
+    pub fn get_governance_dashboard(env: Env) -> GovernanceDashboard {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        Self::build_governance_dashboard(&env)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Deduplication policies (issue #366)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Set the global dedup policy.
+    pub fn set_dedup_policy(env: Env, caller: Address, policy: DedupPolicy) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_governance_not_paused(&env);
+        Self::require_owner_or_multisig(&env, &caller);
+        // Validate the discriminant.
+        Self::dedup_policy_from_discriminant(&env, policy as u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::DedupPolicyConfig, &policy);
+        env.events().publish(
+            (Symbol::new(&env, "dedup"), Symbol::new(&env, "policy_set")),
+            (caller, policy as u32),
+        );
+    }
+
+    /// Get the global dedup policy (defaults to `ContentHash`).
+    pub fn get_dedup_policy(env: Env) -> DedupPolicy {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::DedupPolicyConfig)
+            .unwrap_or(DedupPolicy::ContentHash)
+    }
+
+    /// Set (or clear, when `policy` is `None`) a per-event-type dedup policy override.
+    pub fn set_dedup_policy_for_type(env: Env, caller: Address, event_type: Symbol, policy: Option<DedupPolicy>) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_governance_not_paused(&env);
+        Self::require_owner_or_multisig(&env, &caller);
+        if let Some(p) = policy {
+            Self::dedup_policy_from_discriminant(&env, p as u32);
+            env.storage()
+                .instance()
+                .set(&DataKey::DedupPolicyConfigForType(event_type.clone()), &p);
+        } else {
+            env.storage()
+                .instance()
+                .remove(&DataKey::DedupPolicyConfigForType(event_type.clone()));
+        }
+        env.events().publish(
+            (Symbol::new(&env, "dedup"), Symbol::new(&env, "policy_set_type")),
+            (caller, event_type, policy.map(|p| p as u32)),
+        );
+    }
+
+    /// Get the effective dedup policy for an event type.
+    pub fn get_dedup_policy_for_type(env: Env, event_type: Symbol) -> DedupPolicy {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        Self::effective_dedup_policy(&env, &event_type)
+    }
+
+    /// Log an event while supplying an explicit deduplication key for the `Custom`
+    /// policy. The key is only consulted while the `Custom` policy is effective for
+    /// the event type; otherwise behaviour matches `log_event`.
+    pub fn log_event_with_custom_key(
+        env: Env,
+        submitter: Address,
+        event_type: Symbol,
+        metadata: Bytes,
+        category: Option<Symbol>,
+        sub_event_type: Option<Symbol>,
+        force: bool,
+        custom_key: Option<BytesN<32>>,
+    ) -> BytesN<32> {
+        if let Some(key) = custom_key.clone() {
+            env.storage().temporary().set(&DataKey::PendingCustomDedupKey, &key);
+        }
+        let id = Self::log_event_with_hierarchy(
+            env.clone(),
+            submitter,
+            event_type,
+            metadata,
+            category,
+            sub_event_type,
+            force,
+        );
+        env.storage().temporary().remove(&DataKey::PendingCustomDedupKey);
+        id
+    }
+
+    /// Remove stale dedup index entries (content-hash, content-hash-with-timestamp,
+    /// and custom-key maps) whose recorded index no longer points at an event whose
+    /// re-computed content matches. Admin/owner-only.
+    pub fn cleanup_stale_dedup_entries(
         env: Env,
         caller: Address,
-        allocation: MineralAllocation,
+        start_index: u32,
+        batch_size: u32,
     ) -> u32 {
+        Self::require_initialized(&env);
         caller.require_auth();
-        Self::require_owner(&env, &caller);
+        Self::require_governance_not_paused(&env);
+        Self::require_owner_or_multisig(&env, &caller);
 
-        let key = DataKey::CMAllocation(allocation.allocation_id.clone());
-        if env.storage().instance().has(&key) {
-            panic_with_error!(&env, ContractError::CMAllocationExists);
+        let total = Self::total_events_internal(&env);
+        let mut cleaned: u32 = 0;
+        let mut idx = start_index;
+        let end = (start_index + batch_size).min(total);
+
+        while idx < end {
+            if let Some(event_id) = env
+                .storage()
+                .instance()
+                .get::<_, BytesN<32>>(&DataKey::EventOrder(idx))
+            {
+                if let Some(evt) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Event>(&DataKey::EventData(event_id.clone()))
+                {
+                    let content_hash =
+                        Self::compute_content_hash(&env, &evt.event_type, &evt.submitter, &evt.metadata);
+                    // ContentHash map
+                    if let Some(stored_index) = env
+                        .storage()
+                        .instance()
+                        .get::<_, u32>(&DataKey::EventContentHash(content_hash.clone()))
+                    {
+                        if stored_index != idx {
+                            env.storage()
+                                .instance()
+                                .remove(&DataKey::EventContentHash(content_hash.clone()));
+                            cleaned += 1;
+                        }
+                    }
+                    // ContentHashWithTimestamp map
+                    if let Some((stored_index, _)) = env
+                        .storage()
+                        .instance()
+                        .get::<_, (u32, u64)>(&DataKey::EventContentHashWithTs(content_hash.clone()))
+                    {
+                        if stored_index != idx {
+                            env.storage()
+                                .instance()
+                                .remove(&DataKey::EventContentHashWithTs(content_hash));
+                            cleaned += 1;
+                        }
+                    }
+                }
+            }
+            idx += 1;
         }
 
-        let count: u32 = env
+        env.events()
+            .publish((Symbol::new(&env, "stale_dedup_cleaned"),), (cleaned,));
+        cleaned
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Archiving configuration (issue #367)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Set the archiving configuration (compression + off-chain storage).
+    /// Admin/owner-only.
+    pub fn set_archive_config(env: Env, caller: Address, config: ArchiveConfig) {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_governance_not_paused(&env);
+        Self::require_owner_or_multisig(&env, &caller);
+        env.storage().instance().set(&DataKey::ArchiveConfig, &config);
+        env.events().publish(
+            (Symbol::new(&env, "archive"), Symbol::new(&env, "config_set")),
+            (
+                caller,
+                config.offchain_storage,
+                config.compression,
+            ),
+        );
+    }
+
+    /// Current archiving configuration.
+    pub fn get_archive_config(env: Env) -> Option<ArchiveConfig> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        env.storage().instance().get(&DataKey::ArchiveConfig)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Event versioning — semantic diffs & audit trail (issue #368)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Structured audit trail for an event: every recorded `EventVersion`
+    /// (initial + every update/rollback), in ascending version order. The
+    /// `updated_by`/`updated_at` fields give a non-repudiable change log.
+    pub fn get_event_audit_trail(env: Env, index: u32) -> Vec<EventVersion> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let total = Self::total_events_internal(&env);
+        if index >= total {
+            return Vec::new(&env);
+        }
+        if let Some(versions) = env
             .storage()
             .instance()
-            .get(&DataKey::CMAllocationCount)
-            .unwrap_or(0u32);
-
-        env.storage().instance().set(&key, &allocation);
-        env.storage()
-            .instance()
-            .set(&DataKey::CMAllocationCount, &(count + 1));
-
-        env.events().publish(
-            (symbol_short!("cm"), symbol_short!("alloc")),
-            (caller, allocation.allocation_id.clone(), allocation.mineral.clone()),
-        );
-
-        count
+            .get::<_, Vec<EventVersion>>(&DataKey::EventVersions(index))
+        {
+            return versions;
+        }
+        // No written history: build a single-entry trail from the current event.
+        let event_id: BytesN<32> = env.storage().instance().get(&DataKey::EventOrder(index)).unwrap();
+        let event: Event = env.storage().instance().get(&DataKey::EventData(event_id)).unwrap();
+        let mut trail = Vec::new(&env);
+        trail.push_back(EventVersion {
+            version: 0,
+            data: event.clone(),
+            updated_at: event.timestamp,
+            updated_by: event.submitter,
+        });
+        trail
     }
 
-    /// Retrieve a mineral allocation by allocation_id.
-    pub fn get_mineral_allocation(env: Env, allocation_id: Symbol) -> MineralAllocation {
-        env.storage()
-            .instance()
-            .get(&DataKey::CMAllocation(allocation_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::CMAllocationNotFound))
-    }
-
-    /// Return total mineral allocations recorded.
-    pub fn cm_allocation_count(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CMAllocationCount)
-            .unwrap_or(0u32)
-    }
-
-    /// Register a smelter in the conflict minerals registry. Owner-only.
-    pub fn record_smelter(env: Env, caller: Address, smelter: Smelter) -> u32 {
+    /// Attach a human-readable tag to a specific historical version (e.g.
+    /// `approved`, `superseded`). Admin/owner-only.
+    pub fn tag_event_version(env: Env, caller: Address, index: u32, version: u32, tag: Symbol) {
+        Self::require_initialized(&env);
         caller.require_auth();
-        Self::require_owner(&env, &caller);
+        Self::require_governance_not_paused(&env);
+        Self::require_owner_or_multisig(&env, &caller);
+        let total = Self::total_events_internal(&env);
+        if index >= total {
+            panic_with_error!(&env, ContractError::EventDoesNotExist);
+        }
+        let trail = Self::get_event_audit_trail(env.clone(), index);
+        if version >= trail.len() as u32 {
+            panic_with_error!(&env, ContractError::InvalidVersion);
+        }
+        env.storage().instance().set(&DataKey::EventVersionTag(index, version), &tag);
+        env.events().publish(
+            (Symbol::new(&env, "versioning"), Symbol::new(&env, "version_tagged")),
+            (caller, index, version, tag),
+        );
+    }
 
-        let key = DataKey::CMSmelter(smelter.smelter_id.clone());
-        if env.storage().instance().has(&key) {
-            panic_with_error!(&env, ContractError::CMSmelterExists);
+    /// Read the tag attached to a given version, if any.
+    pub fn get_event_version_tag(env: Env, index: u32, version: u32) -> Option<Symbol> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        env.storage().instance().get(&DataKey::EventVersionTag(index, version))
+    }
+
+    /// Semantic field-level diff between two versions of an event
+    /// (issue #368). Versions are 0-based indices into the event's audit trail.
+    pub fn get_event_diff(env: Env, index: u32, from_version: u32, to_version: u32) -> Vec<FieldChange> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let trail = Self::get_event_audit_trail(env.clone(), index);
+        if trail.is_empty() {
+            return Vec::new(&env);
+        }
+        if from_version >= trail.len() as u32 || to_version >= trail.len() as u32 {
+            panic_with_error!(&env, ContractError::InvalidVersion);
+        }
+        let from_data = &trail.get(from_version).unwrap().data;
+        let to_data = &trail.get(to_version).unwrap().data;
+        Self::diff_events(&env, from_data, to_data)
+    }
+
+    /// Detailed structural comparison of two versions of an event with hashes.
+    pub fn compare_event_versions_detailed(
+        env: Env,
+        index: u32,
+        from_version: u32,
+        to_version: u32,
+    ) -> VersionComparison {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        let trail = Self::get_event_audit_trail(env.clone(), index);
+        if trail.is_empty() {
+            panic_with_error!(&env, ContractError::EventDoesNotExist);
+        }
+        if from_version >= trail.len() as u32 || to_version >= trail.len() as u32 {
+            panic_with_error!(&env, ContractError::InvalidVersion);
+        }
+        let from = &trail.get(from_version).unwrap();
+        let to = &trail.get(to_version).unwrap();
+        let changes = Self::diff_events(&env, &from.data, &to.data);
+        VersionComparison {
+            index,
+            from_version,
+            to_version,
+            same: changes.is_empty(),
+            changes,
+            from_hash: from.data.event_hash.clone(),
+            to_hash: to.data.event_hash.clone(),
+        }
+    }
+
+    // ── private helpers ─────────────────────────────────────────────────────
+
+    /// Whether the leading byte marks an archived payload as compressed.
+    fn is_compressed_tag(_env: &Env, payload: &Bytes) -> bool {
+        payload.len() >= 1 && payload.get(0) == Some(0x01)
+    }
+
+    /// Tag a raw payload as uncompressed (`0x00` prefix so reads can distinguish it).
+    fn tag_raw_bytes(env: &Env, payload: &Bytes) -> Bytes {
+        let mut out = Bytes::new(env);
+        out.push_back(0x00);
+        for i in 0..payload.len() {
+            out.push_back(payload.get(i).unwrap());
+        }
+        out
+    }
+
+    /// Run-length compression (mode 1) used for archived metadata.
+    ///
+    /// Encoding: first byte `0x01` = tag; then a stream of items:
+    /// - `0x01, byte, len_le16` — a run of `len` (≥ 3) copies of `byte`;
+    /// - `0x00, byte` — a single literal `byte` (escape for the tag byte);
+    /// - anything else — a literal byte.
+    fn compress_bytes(env: &Env, payload: &Bytes) -> Bytes {
+        let mut out = Bytes::new(env);
+        out.push_back(0x01);
+        let mut i: u32 = 0;
+        let n = payload.len();
+        while i < n {
+            let b = payload.get(i).unwrap();
+            let mut run: u32 = 1;
+            while i + run < n && payload.get(i + run) == Some(b) {
+                run += 1;
+            }
+            if run >= 3 {
+                out.push_back(0x01);
+                out.push_back(b);
+                out.push_back((run & 0xff) as u8);
+                out.push_back(((run >> 8) & 0xff) as u8);
+            } else {
+                for _ in 0..run {
+                    if b == 0x00 || b == 0x01 {
+                        out.push_back(0x00);
+                    }
+                    out.push_back(b);
+                }
+            }
+            i += run;
+        }
+        out
+    }
+
+    /// Reverse of `compress_bytes` / tag stripping.
+    fn expand_archived_metadata(env: &Env, payload: &Bytes) -> Bytes {
+        let mut out = Bytes::new(env);
+        if payload.len() == 0 {
+            return out;
+        }
+        let tag = payload.get(0).unwrap();
+        if tag == 0x00 {
+            // raw payload
+            for i in 1..payload.len() {
+                out.push_back(payload.get(i).unwrap());
+            }
+            return out;
+        }
+        if tag != 0x01 {
+            // unknown tag: return as-is
+            return payload.clone();
+        }
+        let mut i: u32 = 1;
+        let n = payload.len();
+        while i < n {
+            let c = payload.get(i).unwrap();
+            i += 1;
+            match c {
+                0x00 => {
+                    // escaped literal
+                    if i < n {
+                        out.push_back(payload.get(i).unwrap());
+                        i += 1;
+                    }
+                }
+                0x01 => {
+                    // run: byte, len_le16 (allowmalformed tail by stopping)
+                    if i + 3 < n {
+                        let b = payload.get(i).unwrap();
+                        let len = payload.get(i + 1).unwrap() as u32
+                            | ((payload.get(i + 2).unwrap() as u32) << 8);
+                        for _ in 0..len {
+                            out.push_back(b);
+                        }
+                        i += 3;
+                    }
+                }
+                other => {
+                    out.push_back(other);
+                }
+            }
+        }
+        out
+    }
+
+    /// Build the fully-qualified retrieval URL for an off-chain archived event:
+    /// `base_url || 64-hex-chars-of-event-id`.
+    fn build_archive_url(env: &Env, config: &ArchiveConfig, id: &BytesN<32>) -> Bytes {
+        let mut out = Bytes::new(env);
+        for i in 0..config.base_url.len() {
+            out.push_back(config.base_url.get(i).unwrap());
+        }
+        // Hex-encode the 32-byte ID (no alloc::hex dependency available in no_std).
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for i in 0..32 {
+            let b = id.to_array()[i as usize];
+            out.push_back(HEX[((b >> 4) & 0x0f) as usize]);
+            out.push_back(HEX[(b & 0x0f) as usize]);
+        }
+        out
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CQRS & Event Sourcing API (Issue #412)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Command: Log a new event through the CQRS write model.
+    ///
+    /// Validates caller auth, pause state, rate limits, metadata size, schemas,
+    /// and idempotency, persists to both primary ledger and append-only event store,
+    /// updates materialized views and projections, and returns a `CommandResult`.
+    pub fn cqrs_log_event(env: Env, cmd: LogEventCommand) -> CommandResult {
+        Self::require_initialized(&env);
+        Self::require_log_events_not_paused(&env);
+
+        // Check command-level idempotency
+        if let Some(ref idemp) = cmd.idempotency_key {
+            if let Some(existing) = env
+                .storage()
+                .instance()
+                .get::<_, CommandResult>(&CqrsStorageKey::Idempotency(idemp.clone()))
+            {
+                return existing;
+            }
         }
 
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CMSmelterCount)
-            .unwrap_or(0u32);
-
-        env.storage().instance().set(&key, &smelter);
-        env.storage()
-            .instance()
-            .set(&DataKey::CMSmelterCount, &(count + 1));
-
-        env.events().publish(
-            (symbol_short!("cm"), symbol_short!("smelter")),
-            (caller, smelter.smelter_id.clone(), smelter.mineral_type.clone()),
+        // Delegate to existing core logic for full validation and persistence
+        let event_id = Self::log_event_with_hierarchy(
+            env.clone(),
+            cmd.submitter.clone(),
+            cmd.event_type.clone(),
+            cmd.metadata.clone(),
+            cmd.category.clone(),
+            cmd.sub_event_type.clone(),
+            cmd.force,
         );
 
-        count
+        // Append to CQRS event store and update projection
+        CqrsEngine::record_log_event(&env, event_id, &cmd, env.ledger().timestamp())
     }
 
-    /// Retrieve a smelter by smelter_id.
-    pub fn get_smelter(env: Env, smelter_id: Symbol) -> Smelter {
-        env.storage()
+    /// Command: Update an event's metadata through the CQRS write model.
+    pub fn cqrs_update_event(env: Env, cmd: UpdateEventCommand) -> CommandResult {
+        Self::require_initialized(&env);
+        Self::require_log_events_not_paused(&env);
+        cmd.caller.require_auth();
+        Self::require_owner_or_multisig(&env, &cmd.caller);
+
+        let evt: Event = match env
+            .storage()
             .instance()
-            .get(&DataKey::CMSmelter(smelter_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::CMSmelterNotFound))
+            .get(&DataKey::EventData(cmd.event_id.clone()))
+        {
+            Some(e) => e,
+            None => {
+                return CommandResult {
+                    success: false,
+                    event_id: Some(cmd.event_id),
+                    sequence_number: 0,
+                    error_code: Some(ContractError::EventDoesNotExist as u32),
+                    message: Some(Symbol::new(&env, "not_found")),
+                };
+            }
+        };
+
+        let new_id = Self::update_event(
+            env.clone(),
+            cmd.caller.clone(),
+            evt.index,
+            cmd.new_metadata.clone(),
+        );
+
+        CqrsEngine::record_update_event(
+            &env,
+            new_id,
+            cmd.caller,
+            cmd.event_id,
+            evt.event_type,
+            cmd.new_metadata,
+            evt.version.saturating_add(1),
+            env.ledger().timestamp(),
+        )
     }
+
+    /// Command: Execute a governance command via CQRS pipeline.
+    pub fn cqrs_governance(env: Env, cmd: GovernanceCommand) -> CommandResult {
+        Self::require_initialized(&env);
+        Self::require_governance_not_paused(&env);
+        cmd.caller.require_auth();
+        Self::require_owner_or_multisig(&env, &cmd.caller);
+
+        // Execute recognized governance action
+        if cmd.action == Symbol::new(&env, "set_paused") {
+            if let Some(paused) = cmd.param_bool {
+                Self::set_paused(env.clone(), cmd.caller.clone(), paused);
+            }
+        } else if cmd.action == Symbol::new(&env, "set_max_logs") {
+            if let Some(max_logs) = cmd.param_u32 {
+                Self::set_global_max_logs(env.clone(), cmd.caller.clone(), max_logs);
+            }
+        } else if cmd.action == Symbol::new(&env, "set_type_cap") {
+            if let (Some(evt_type), Some(cap)) = (cmd.param_symbol.clone(), cmd.param_u32) {
+                Self::set_event_max_logs(env.clone(), cmd.caller.clone(), evt_type, cap);
+            }
+        } else if cmd.action == Symbol::new(&env, "remove_cap") {
+            if let Some(evt_type) = cmd.param_symbol.clone() {
+                Self::remove_event_cap(env.clone(), cmd.caller.clone(), evt_type);
+            }
+        } else if cmd.action == Symbol::new(&env, "transfer_owner") {
+            if let Some(new_owner) = cmd.target_address.clone() {
+                Self::transfer_ownership(env.clone(), cmd.caller.clone(), new_owner);
+            }
+        }
+
+        CqrsEngine::record_governance_command(&env, cmd.caller, cmd.action, env.ledger().timestamp())
+    }
+
+    /// Command: Capture a point-in-time snapshot of the projection state.
+    pub fn cqrs_create_snapshot(env: Env, caller: Address) -> u32 {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_owner_or_multisig(&env, &caller);
+        CqrsEngine::create_snapshot(&env)
+    }
+
+    /// Command: Rebuild projection state by replaying all sequenced events from the log.
+    ///
+    /// If `from_snapshot` is true and a snapshot exists, replays only events after that snapshot.
+    /// If CQRS event store has not yet ingested events from the primary ledger, imports them first.
+    pub fn cqrs_rebuild_projection(env: Env, caller: Address, from_snapshot: bool) -> EventProjection {
+        Self::require_initialized(&env);
+        caller.require_auth();
+        Self::require_owner_or_multisig(&env, &caller);
+
+        let current_cqrs_seq: u32 = env
+            .storage()
+            .instance()
+            .get(&CqrsStorageKey::EventSequence)
+            .unwrap_or(0);
+        if current_cqrs_seq == 0 {
+            let total = Self::total_events_internal(&env);
+            for i in 0..total {
+                if let Some(id) = env.storage().instance().get::<_, BytesN<32>>(&DataKey::EventOrder(i)) {
+                    if let Some(evt) = env.storage().instance().get::<_, Event>(&DataKey::EventData(id.clone())) {
+                        let cmd = LogEventCommand {
+                            submitter: evt.submitter,
+                            event_type: evt.event_type,
+                            metadata: evt.metadata,
+                            category: Some(evt.category),
+                            sub_event_type: evt.sub_event_type,
+                            idempotency_key: None,
+                            force: true,
+                        };
+                        CqrsEngine::record_log_event(&env, id, &cmd, evt.timestamp);
+                    }
+                }
+            }
+        }
+
+        CqrsEngine::rebuild_projection(&env, from_snapshot)
+    }
+
+    // ── CQRS Query Side (Read Path) ─────────────────────────────────────────
+
+    /// Query: Retrieve an `EventView` by its content-addressed 32-byte event ID.
+    pub fn cqrs_get_event_view(env: Env, event_id: BytesN<32>) -> Option<EventView> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::get_event_view(&env, event_id)
+    }
+
+    /// Query: Retrieve an `EventView` by its monotonic sequence number.
+    pub fn cqrs_get_event_by_sequence(env: Env, sequence: u32) -> Option<EventView> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::get_event_by_sequence(&env, sequence)
+    }
+
+    /// Query: Filter and paginate event views using the CQRS read model.
+    pub fn cqrs_query_events(env: Env, query: EventQuery) -> Vec<EventView> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::query_events(&env, query)
+    }
+
+    /// Query: Get the current live projection state (counts, totals, last sequence).
+    pub fn cqrs_get_projection(env: Env) -> EventProjection {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::get_projection(&env)
+    }
+
+    /// Query: Retrieve a saved projection snapshot by ID.
+    pub fn cqrs_get_snapshot(env: Env, snapshot_id: u32) -> Option<ProjectionSnapshot> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::get_snapshot(&env, snapshot_id)
+    }
+
+    /// Query: Fast materialized count lookup for an event type.
+    pub fn cqrs_mat_type_count(env: Env, event_type: Symbol) -> u32 {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::get_materialized_type_count(&env, event_type)
+    }
+
+    /// Query: Fast materialized index lookup of event IDs by type with pagination.
+    pub fn cqrs_mat_type_events(
+        env: Env,
+        event_type: Symbol,
+        start: u32,
+        limit: u32,
+    ) -> Vec<BytesN<32>> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::get_materialized_type_events(&env, event_type, start, limit)
+    }
+
+    /// Query: Fast materialized index lookup of sequence numbers by submitter with pagination.
+    pub fn cqrs_mat_sub_events(
+        env: Env,
+        submitter: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<u32> {
+        Self::require_initialized(&env);
+        Self::require_queries_not_paused(&env);
+        CqrsEngine::get_materialized_submitter_events(&env, submitter, start, limit)
+    }
+
+    /// Compute the `Vec<FieldChange>` between two event snapshots.
+    fn diff_events(env: &Env, from: &Event, to: &Event) -> Vec<FieldChange> {
+        let mut changes: Vec<FieldChange> = Vec::new(env);
+        Self::push_field_change(env, &mut changes, "metadata", &Self::bytes_field(env, &from.metadata), &Self::bytes_field(env, &to.metadata));
+        Self::push_field_change(env, &mut changes, "event_type", &Self::bytes_field(env, &Self::symbol_bytes(env, &from.event_type)), &Self::bytes_field(env, &Self::symbol_bytes(env, &to.event_type)));
+        Self::push_field_change(env, &mut changes, "category", &Self::bytes_field(env, &Self::symbol_bytes(env, &from.category)), &Self::bytes_field(env, &Self::symbol_bytes(env, &to.category)));
+        Self::push_field_change(env, &mut changes, "submitter", &Self::bytes_field(env, &Self::strkey_bytes(env, &from.submitter)), &Self::bytes_field(env, &Self::strkey_bytes(env, &to.submitter)));
+        Self::push_field_change(env, &mut changes, "timestamp", &Self::bytes_field(env, &Self::u64_to_bytes(env, from.timestamp)), &Self::bytes_field(env, &Self::u64_to_bytes(env, to.timestamp)));
+        Self::push_field_change(env, &mut changes, "version", &Self::bytes_field(env, &Self::u32_to_bytes(env, from.version)), &Self::bytes_field(env, &Self::u32_to_bytes(env, to.version)));
+        changes
+    }
+
+    fn push_field_change(env: &Env, changes: &mut Vec<FieldChange>, field: &str, from: &Bytes, to: &Bytes) {
+        if from != to {
+            changes.push_back(FieldChange {
+                field: Symbol::new(env, field),
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+    }
+
+    fn bytes_field(_env: &Env, b: &Bytes) -> Bytes {
+        b.clone()
+    }
+
+    fn symbol_bytes(env: &Env, s: &Symbol) -> Bytes {
+        // `Symbol::to_string` is host-only; XDR is the deterministic on-chain form.
+        use soroban_sdk::xdr::ToXdr;
+        s.to_xdr(env)
+    }
+
+    fn strkey_bytes(_env: &Env, addr: &Address) -> Bytes {
+        addr.to_string().to_bytes()
+    }
+
+    /// Internal builder for `get_governance_dashboard`.
+    fn build_governance_dashboard(env: &Env) -> GovernanceDashboard {
+        GovernanceDashboard::load(env)
+    }
+}
 
 #[cfg(test)]
 mod comprehensive_fuzz;
@@ -4793,14 +7218,22 @@ pub mod cbdc_interop;
 pub mod cbdc_offline;
 pub mod cbdc_privacy;
 
+// Cursor-based pagination & filtered batch queries for the CBDC privacy guard
+// (issue #852). Re-exported so SDK bindings and tests can reach the pagination
+// types and query entrypoints without a fully-qualified module path.
+pub use cbdc_privacy::{
+    PageCursor, PageLimit, QueryFilter, PaginatedQueryResult, CbdcPrivacyQuery, CbdcPrivacyQueryClient,
+};
+
+// Governance dashboard types & audit trail (issue #365 governance UI).
+pub mod governance_dashboard;
+
 #[cfg(test)]
 mod cbdc_tests;
 
-use cbdc_types::*;
-use cbdc_logging::*;
-use cbdc_interop::*;
-use cbdc_offline::*;
-use cbdc_privacy::*;
+#[cfg(test)]
+mod cbdc_privacy_pagination_tests;
+
 
 // SupTech Integration Modules
 pub mod suptech_types;
@@ -4813,12 +7246,6 @@ pub mod suptech_integration;
 #[cfg(test)]
 mod suptech_tests;
 
-use suptech_types::*;
-use suptech_feeds::*;
-use suptech_reporting::*;
-use suptech_api::*;
-use suptech_rules::*;
-use suptech_integration::*;
 
 // Regulatory Sandbox Modules
 pub mod sandbox_types;
@@ -4828,8 +7255,32 @@ pub mod sandbox_supervision;
 pub mod sandbox_innovation;
 pub mod sandbox_graduation;
 
+// On-chain ML feature vector lineage and hash anchoring (issue #856, #858).
+pub mod ml_feature_store;
+
+// FinOps Module
+pub mod finops;
+
+// Role-Based Access Control (issue #686 #689 #688 #687)
+pub mod rbac;
+
+// Storage layout snapshot for upgrade safety validation (issue #414).
+pub mod storage_layout;
+
+#[cfg(test)]
+mod finops_tests;
+
+#[cfg(test)]
+mod finops_invariant_tests;
+
 #[cfg(test)]
 mod supply_chain_tests;
+
+#[cfg(test)]
+mod rbac_gating_tests;
+
+#[cfg(test)]
+mod governance_dashboard_tests;
 
 #[cfg(test)]
 mod data_retention_tests;

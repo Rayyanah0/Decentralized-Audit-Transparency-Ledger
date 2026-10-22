@@ -10,6 +10,7 @@ use crate::rwa_types::{
     ComplianceCheck, ComplianceFramework, InvestorProfile, KycTier, RwaToken, TokenizationStatus,
 };
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
+use soroban_sdk::xdr::ToXdr;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
